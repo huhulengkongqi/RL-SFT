@@ -1,0 +1,20 @@
+[project]
+name = "agent-sft"
+version = "0.1.0"
+description = "Agentic RL SFT Data Synthesis Pipeline - Task generation, trajectory sampling, quality filtering, and dataset construction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.96.0",
+    "httpx>=0.28.1",
+    "openai>=2.32.0",
+    "pydantic>=2.13.2",
+    "rich>=15.0.0",
+    "tenacity>=9.1.4",
+    "transformers>=5.5.4",
+]
+
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"

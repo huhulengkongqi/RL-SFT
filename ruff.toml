@@ -1,0 +1,26 @@
+line-length = 120
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+]
+ignore = [
+    "E501",   # line too long (handled by line-length)
+    "B008",   # function call defaults
+]
+
+[lint.isort]
+case-sensitive = true
+known-first-party = ["agent_sft", "infra"]
+
+[format]
+line-length = 120
+quote-style = "double"
