@@ -1,0 +1,10 @@
+# 要求 NVIDIA 驱动 >= 550.x (CUDA 12.4+)
+# 如果驱动版本 < 550，请先更新驱动
+FROM vllm/vllm-openai:v0.6.3
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir anthropic openai tenacity rich
+
+ENV HF_HOME=/root/.cache/huggingface
+ENV VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ

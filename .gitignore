@@ -179,6 +179,14 @@ artifacts/
 # uv
 .uv/
 
+# Claude IDE
+.claude/
+
+# Local test files
+test_*.py
+*.test.py
+test.py
+
 # Temporary directories
 tmp/
 temp/

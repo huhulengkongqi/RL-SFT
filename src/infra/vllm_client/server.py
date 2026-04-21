@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+try:
+    import docker
+    from docker.errors import DockerException
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+
 
 @dataclass
 class VLLMServerConfig:
@@ -138,6 +145,119 @@ def start_local_server(
     return server
 
 
+class DockerVLLMServer:
+    """vLLM server running in Docker container."""
+
+    def __init__(self, config: VLLMServerConfig, image: str = "vllm-vllm-openai:latest"):
+        if not DOCKER_AVAILABLE:
+            raise ImportError("docker package is required for DockerVLLMServer")
+        self.config = config
+        self.image = image
+        self._client = None
+        self._container = None
+
+    def _get_client(self):
+        """Get Docker client."""
+        if self._client is None:
+            self._client = docker.from_env()
+        return self._client
+
+    def _build_command(self) -> List[str]:
+        """Build vLLM command for Docker."""
+        cmd = [
+            "--model", self.config.model,
+            "--host", "0.0.0.0",
+            "--port", str(self.config.port),
+            "--gpu-memory-utilization", str(self.config.gpu_memory_utilization),
+            "--tensor-parallel-size", str(self.config.tensor_parallel_size),
+            "--dtype", self.config.dtype,
+        ]
+
+        if self.config.max_model_len:
+            cmd.extend(["--max-model-len", str(self.config.max_model_len)])
+
+        if self.config.quantization:
+            cmd.extend(["--quantization", self.config.quantization])
+
+        if self.config.enable_prefix_caching:
+            cmd.append("--enable-prefix-caching")
+
+        if self.config.trust_remote_code:
+            cmd.append("--trust-remote-code")
+
+        return cmd
+
+    def start(self, remove: bool = True) -> None:
+        """Start the vLLM Docker container."""
+        client = self._get_client()
+
+        env = {"HF_HOME": "/root/.cache/huggingface"}
+        env.update(self.config.extra_env_vars)
+
+        volumes = {
+            "hf_cache": {"bind": "/root/.cache/huggingface", "mode": "rw"},
+        }
+
+        self._container = client.containers.run(
+            self.image,
+            command=self._build_command(),
+            detach=True,
+            remove=remove,
+            ports={f"{self.config.port}/tcp": self.config.port},
+            environment=env,
+            volumes=volumes,
+            device_requests=[
+                docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+            ],
+        )
+
+    def stop(self, timeout: int = 30) -> None:
+        """Stop the vLLM Docker container."""
+        if self._container:
+            try:
+                self._container.stop(timeout=timeout)
+            except Exception:
+                pass
+            self._container = None
+
+    def is_running(self) -> bool:
+        """Check if container is running."""
+        if not self._container:
+            return False
+        try:
+            self._container.reload()
+            return self._container.status == "running"
+        except Exception:
+            return False
+
+    @property
+    def base_url(self) -> str:
+        """Get server base URL."""
+        return f"http://localhost:{self.config.port}/v1"
+
+
+def start_docker_server(
+    model: str,
+    port: int = 8000,
+    gpu_memory_utilization: float = 0.85,
+    tensor_parallel_size: int = 1,
+    quantization: Optional[str] = "awq",
+    **kwargs,
+) -> DockerVLLMServer:
+    """Convenience function to start a Dockerized vLLM server."""
+    config = VLLMServerConfig(
+        model=model,
+        port=port,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=tensor_parallel_size,
+        quantization=quantization,
+        **kwargs,
+    )
+    server = DockerVLLMServer(config)
+    server.start()
+    return server
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -149,19 +269,31 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", help="Log file path")
     parser.add_argument("--quantization", help="Quantization method (awq, gptq, fp8, etc.)")
     parser.add_argument("--max-model-len", type=int, help="Maximum model context length")
+    parser.add_argument("--docker", action="store_true", help="Run in Docker container")
 
     args = parser.parse_args()
 
-    print(f"Starting vLLM server with model: {args.model}")
-    server = start_local_server(
-        model=args.model,
-        port=args.port,
-        gpu_memory_utilization=args.gpu_mem,
-        tensor_parallel_size=args.tensor_parallel,
-        quantization=args.quantization,
-        max_model_len=args.max_model_len,
-        log_file=args.log_file,
-    )
+    if args.docker:
+        print(f"Starting vLLM server in Docker with model: {args.model}")
+        server = start_docker_server(
+            model=args.model,
+            port=args.port,
+            gpu_memory_utilization=args.gpu_mem,
+            tensor_parallel_size=args.tensor_parallel,
+            quantization=args.quantization,
+            max_model_len=args.max_model_len,
+        )
+    else:
+        print(f"Starting vLLM server with model: {args.model}")
+        server = start_local_server(
+            model=args.model,
+            port=args.port,
+            gpu_memory_utilization=args.gpu_mem,
+            tensor_parallel_size=args.tensor_parallel,
+            quantization=args.quantization,
+            max_model_len=args.max_model_len,
+            log_file=args.log_file,
+        )
 
     print(f"Server starting on port {args.port}... Press Ctrl+C to stop")
     try:

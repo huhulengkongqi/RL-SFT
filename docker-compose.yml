@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  vllm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.vllm
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model Qwen/Qwen2.5-7B-Instruct-AWQ
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.90
+      --quantization awq
+      --max-model-len 4096
+      --enable-prefix-caching
+      --trust-remote-code
+
+volumes:
+  hf_cache:

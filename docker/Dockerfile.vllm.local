@@ -1,0 +1,31 @@
+# 使用 NVIDIA CUDA 基础镜像，在容器内安装 vLLM
+FROM nvidia/cuda:12.4.0-cudnn-runtime-ubuntu22.04
+
+# 安装 Python 和 pip
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 Python 别名
+RUN ln -s /usr/bin/python3.10 /usr/bin/python
+
+# 升级 pip
+RUN pip install --upgrade pip
+
+# 使用国内源安装 vLLM 和依赖
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    vllm==0.6.3 \
+    anthropic \
+    openai \
+    tenacity \
+    rich
+
+WORKDIR /app
+
+ENV HF_HOME=/root/.cache/huggingface
+ENV VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+
+ENTRYPOINT ["python", "-m", "vllm.entrypoints.openai.api_server"]
