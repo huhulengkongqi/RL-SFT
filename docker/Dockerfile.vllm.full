@@ -1,0 +1,35 @@
+# 使用 NVIDIA CUDA 基础镜像，SHA256 digest 锁定
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04@sha256:2fcc4280646484290cc50dce5e65f388dd04352b07cbe89a635703bd1f9aedb6
+
+LABEL org.opencontainers.image.source="https://github.com/huhulengkongqi/RL-SFT"
+LABEL org.opencontainers.image.description="Full vLLM build from CUDA base for RL-SFT project"
+LABEL org.opencontainers.image.version="0.6.3-rlsft.1"
+
+# 安装 Python 和 pip
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 Python 别名
+RUN ln -s /usr/bin/python3.10 /usr/bin/python
+
+# 固定 pip 版本
+RUN pip install --upgrade pip==24.0
+
+# 使用国内源可选，默认使用官方源
+# 安装 vLLM 和依赖
+RUN pip install --no-cache-dir vllm==0.6.3
+
+# 使用哈希锁定的 requirements 文件安装额外依赖
+COPY docker/requirements-vllm.txt /tmp/requirements-vllm.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-vllm.txt
+
+WORKDIR /app
+
+ENV HF_HOME=/root/.cache/huggingface
+ENV VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+
+ENTRYPOINT ["python", "-m", "vllm.entrypoints.openai.api_server"]

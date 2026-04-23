@@ -1,34 +1,53 @@
 version: "3.8"
 
+x-vllm-common: &vllm-common
+  ports:
+    - "${VLLM_PORT:-8000}:8000"
+  volumes:
+    - ./models:/models
+    - hf_cache:/root/.cache/huggingface
+  environment:
+    - HF_TOKEN=${HF_TOKEN}
+    - VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  command: >
+    --model ${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}
+    --host 0.0.0.0
+    --port 8000
+    --gpu-memory-utilization ${VLLM_GPU_MEMORY:-0.90}
+    --quantization awq
+    --max-model-len 4096
+    --enable-prefix-caching
+    --trust-remote-code
+
 services:
+  # 默认模式：直接拉取预构建镜像 (最快)
   vllm:
+    <<: *vllm-common
+    profiles: ["pull"]
+    image: ${VLLM_IMAGE:-ghcr.io/huhulengkongqi/rl-sft-vllm:v0.6.3-rlsft.1}
+
+  # build 模式：基于官方 vLLM 镜像构建
+  vllm-build:
+    <<: *vllm-common
+    profiles: ["build"]
     build:
       context: .
       dockerfile: docker/Dockerfile.vllm
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./models:/models
-      - hf_cache:/root/.cache/huggingface
-    environment:
-      - HF_TOKEN=${HF_TOKEN}
-      - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: >
-      --model Qwen/Qwen2.5-7B-Instruct-AWQ
-      --host 0.0.0.0
-      --port 8000
-      --gpu-memory-utilization 0.90
-      --quantization awq
-      --max-model-len 4096
-      --enable-prefix-caching
-      --trust-remote-code
+
+  # full 模式：从 CUDA 基础镜像完整构建 (最可控)
+  vllm-full:
+    <<: *vllm-common
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.vllm.full
 
 volumes:
   hf_cache:

@@ -1,10 +1,18 @@
 # 要求 NVIDIA 驱动 >= 550.x (CUDA 12.4+)
-# 如果驱动版本 < 550，请先更新驱动
-FROM vllm/vllm-openai:v0.6.3
+# 基础镜像使用 SHA256 digest 锁定，确保可复现性
+FROM vllm/vllm-openai:v0.6.3@sha256:b8374cee0a1acaec8b64525ff77560f30443f67bd0fc1956a3529504a89f823b
+
+LABEL org.opencontainers.image.source="https://github.com/huhulengkongqi/RL-SFT"
+LABEL org.opencontainers.image.description="vLLM inference server for RL-SFT project"
+LABEL org.opencontainers.image.version="0.6.3-rlsft.1"
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir anthropic openai tenacity rich
+# 使用哈希锁定的 requirements 文件，确保依赖版本一致
+COPY docker/requirements-vllm.txt /tmp/requirements-vllm.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-vllm.txt
 
 ENV HF_HOME=/root/.cache/huggingface
 ENV VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+
+ENTRYPOINT ["python", "-m", "vllm.entrypoints.openai.api_server"]
