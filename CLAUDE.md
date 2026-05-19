@@ -192,6 +192,19 @@ src/
 ### LLM Client Interface
 All three clients (`VLLMClient`, `AnthropicClient`, `LocalLLMClient`) share a duck-typed interface: `chat()`, `achat()`, `achat_stream()`. `TaskGenerator` accepts any of them via dependency injection — it only calls `achat()`.
 
+### LLM Client Selection Guide
+| Client | Use Case | Pros | Cons |
+|--------|----------|------|------|
+| **VLLMClient** | Local GPU inference with vLLM Docker | Fast, no rate limits, OpenAI-compatible | Requires GPU ≥ 16GB VRAM |
+| **AnthropicClient** | Volcano Claude API (China region) | High quality, thinking mode support | Rate limited, requires API token |
+| **LocalLLMClient** | Direct HuggingFace transformers | CPU/GPU compatible, no server needed | Slower, memory intensive |
+
+**AnthropicClient Special Features:**
+- `create_volcano_claude_client()` factory function for quick initialization
+- `sleep_before_request` / `sleep_after_request` parameters for rate limiting
+- `achat_stream()` async streaming support
+- Thinking mode extraction (handles `<thinking>` blocks in responses)
+
 ### Task Generation Flow
 ```
 SeedPromptPool
@@ -252,6 +265,24 @@ Output: `data/evolved/final_evolved.json` + per-generation statistics.
 - **Retry Pattern**: Tenacity with exponential backoff
 - **Strategy Pattern**: Domain-specific validators
 
+### Function Registry System
+The `FunctionRegistry` provides dynamic function resolution and validation:
+- **Categories**: `BUILTIN` (Python builtins), `STANDARD_LIBRARY` (stdlib modules), `CUSTOM` (user-defined)
+- Used by `FunctionSignatureParser` to AST-validate function calls in generated tasks
+- Supports category-based filtering during task generation
+
+### Sandbox Execution
+The Docker-based sandbox provides isolated code execution:
+- **SandboxConfig**: `memory_limit`, `disk_limit`, `network_access`, `image`, `timeout`
+- **Lifecycle**: Async context manager creates/destroys containers automatically
+- **Validation**: Runs test cases against generated code and returns `TestCaseExecution` results
+
+### Rate Limiting Patterns
+For Claude API evolution runs:
+- Wrap `client.achat` with random sleep (12-18s by default) before each request
+- Set `max_concurrent_requests=1` for serialized execution
+- Use `discriminator_min_score` filtering to reduce unnecessary API calls
+
 ### Data Structure
 Seed prompts are stored in `data/seed_prompts.json` with 200 high-quality prompts across 4 domains:
 - `code_debug` (50) - Code debugging tasks
@@ -283,7 +314,11 @@ Use `quality_assessment.py` with evolved data for pipeline statistics, but note 
 | `VLLM_GPU_MEMORY` | GPU memory utilization | `0.85` |
 | `VLLM_MODE` | Docker mode: `pull`/`build`/`full` | `pull` |
 | `VLLM_IMAGE` | Docker image name | `ghcr.io/huhulengkongqi/rl-sft-vllm:v0.6.3-rlsft.1` |
+| `VLLM_QUANTIZATION` | Quantization mode | `awq` |
+| `VLLM_USE_DOCKER` | Use Docker for vLLM | `true` |
 | `OPENAI_API_KEY` | For external OpenAI API calls | - |
+| `API_TIMEOUT_MS` | API call timeout in milliseconds | - |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Disable non-essential traffic flag | - |
 | `ANTHROPIC_API_KEY` | For Anthropic API calls (not used by volcano client) | - |
 | `E2B_API_KEY` | For E2B sandbox (optional) | - |
 | `LOG_LEVEL` | Logging level | `INFO` |
@@ -329,8 +364,22 @@ Use `quality_assessment.py` with evolved data for pipeline statistics, but note 
 Enabled categories: `E`, `W`, `F`, `I`, `N`, `UP`, `B`, `SIM`, `TCH`
 Specific ignores: `E501` (line too long), `B008` (allows mutable defaults)
 
+## Testing Structure
+- **`tests/validation/`** - Unit tests for core modules, can run offline
+- **`tests/test_*.py`** - Integration tests, may require Docker/GPU/API tokens
+- **`MockLLMClient`** - Built into `run_evolution.py` for offline testing without real LLM calls
+
+Use `--use-mock` flag with `run_evolution.py` to validate pipeline logic without API calls.
+
 ## Reproducibility Guarantees
 1. **SHA256 Digest Locked Base Images** - All Docker base images pinned by digest
 2. **Hash-Locked Python Dependencies** - `requirements-vllm.txt` includes full SHA256 hashes
 3. **GHCR Provenance Attestation** - GitHub Actions auto-publish with build attestation
 4. **Deterministic Builds** - All pip installs use `--require-hashes`
+
+## Troubleshooting
+- **NVIDIA Driver Mismatch**: Ensure driver version ≥ 550.x for CUDA 12.4
+- **Docker GPU Passthrough**: Run `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` to verify
+- **vLLM Startup Failures**: Check `docker compose logs vllm` for OOM or model download issues
+- **Claude API Rate Limiting**: Increase `--min-sleep` and `--max-sleep` values, reduce concurrency to 1
+- **HF Mirror in China**: Set `HF_ENDPOINT=https://hf-mirror.com` for faster model downloads
