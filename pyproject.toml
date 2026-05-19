@@ -8,11 +8,21 @@ dependencies = [
     "anthropic>=0.96.0",
     "docker>=7.1.0",
     "httpx>=0.28.1",
+    "nltk>=3.8.1",
     "openai>=2.32.0",
     "pydantic>=2.13.2",
     "rich>=15.0.0",
+    "scikit-learn>=1.4.0",
+    "sentence-transformers>=2.5.0",
     "tenacity>=9.1.4",
     "transformers>=5.5.4",
+]
+
+[project.optional-dependencies]
+sandbox = [
+    "docker>=7.1.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
 ]
 
 

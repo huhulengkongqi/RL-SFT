@@ -183,9 +183,8 @@ artifacts/
 .claude/
 
 # Local test files
-test_*.py
-*.test.py
-test.py
+testvllm.py
+simple_merge.py
 
 # Temporary directories
 tmp/

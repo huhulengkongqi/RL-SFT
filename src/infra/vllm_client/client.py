@@ -37,10 +37,12 @@ class VLLMClient:
         base_url: str = "http://localhost:8000/v1",
         api_key: Optional[str] = None,
         timeout: int = 120,
+        model: str = "Qwen/Qwen2.5-7B-Instruct-AWQ",
     ):
         self.base_url = base_url
         self.api_key = api_key or "dummy"
         self.timeout = timeout
+        self.model = model
 
         self._client = OpenAI(
             base_url=self.base_url,
