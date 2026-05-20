@@ -39,12 +39,22 @@ uv run pytest
 # Run specific test file
 uv run pytest tests/test_task_generator.py -v
 uv run pytest tests/test_vllm_client.py -v
+uv run pytest tests/infra/environment/test_environment.py -v  # RL Environment tests
 
-# pytest configuration:
+# pytest configuration (pytest.ini):
 # - testpaths = tests
 # - pythonpath = src
+# - python_files = test_*.py
+# - python_classes = Test*
+# - python_functions = test_*
 # - addopts = -v --tb=short
 # - asyncio_mode = auto
+
+# Run specific test by name
+uv run pytest tests/validation/test_task_generator.py::TestTaskGenerator::test_seed_sampling -v
+
+# Run only offline validation tests (no Docker/GPU required)
+uv run pytest tests/validation/ -v
 ```
 
 ### Linting & Formatting
@@ -77,15 +87,18 @@ uv run mypy src/
 ```
 
 #### Direct Docker Compose
+
+Docker deployment mode is controlled by `VLLM_MODE` env var (set in `.env`) **and** compose profile flags:
+
 ```bash
-# Pull mode (fastest)
+# Pull mode (fastest) - VLLM_MODE=pull
 docker compose --profile pull up -d
 
 # With custom env
 HF_TOKEN=<token> docker compose --profile pull up
 VLLM_PORT=8001 docker compose --profile pull up
 
-# Build modes
+# Build modes - VLLM_MODE=build or VLLM_MODE=full
 docker compose --profile build up --build  # ~2min
 docker compose --profile full up --build   # ~10min
 
@@ -184,9 +197,14 @@ src/
     ├── vllm_client/         # VLLMClient + Docker lifecycle (OpenAI-compatible)
     ├── anthropic_client/    # Volcano Engine Claude endpoint (native protocol)
     ├── local_transformers/  # Direct HuggingFace inference (dev/CPU)
-    └── sandbox/             # IMPLEMENTED — Docker-isolated code execution
-        ├── execution_manager.py  # Container lifecycle + test execution
-        └── models.py        # Execution result data models
+    ├── sandbox/             # IMPLEMENTED — Docker-isolated code execution
+    │   ├── execution_manager.py  # Container lifecycle + test execution
+    │   └── models.py        # Execution result data models
+    └── environment/         # IMPLEMENTED — RL Agent training environment
+        ├── environment.py   # Main env.step() interface
+        ├── sandbox_pool.py  # Docker container pool for concurrency
+        ├── answer_verifier.py  # 3-mode answer validation
+        └── models.py        # Action/Observation/StepResult Pydantic models
 ```
 
 ### LLM Client Interface
@@ -277,6 +295,37 @@ The Docker-based sandbox provides isolated code execution:
 - **Lifecycle**: Async context manager creates/destroys containers automatically
 - **Validation**: Runs test cases against generated code and returns `TestCaseExecution` results
 
+### RL Environment System
+Standard Gym-style `env.step()` interface for agent training:
+- **`Environment`** (`src/infra/environment/environment.py`): Unified action-observation loop
+  - `ToolCallAction`: `exec` (run code), `eval` (evaluate expression)
+  - `FinalAnswerAction`: Submit solution for verification
+  - `reset(task)` → initial observation
+  - `step(action)` → observation + `done` flag
+- **`SandboxPool`** (`src/infra/environment/sandbox_pool.py`): Docker container pool
+  - 30s timeout, 512MB memory limit enforced per container
+  - Async concurrent execution with semaphore control
+  - Container reuse + idle cleanup (configurable `idle_timeout`)
+- **`AnswerVerifier`** (`src/infra/environment/answer_verifier.py`): 3-mode validation
+  - `CODE_EXECUTION` - Run code against test cases in sandbox
+  - `MATH_EQUATION` - SymPy symbolic equivalence + numeric tolerance
+  - `FORMAT_VALIDATION` - Regex/required field checks for open tasks
+- **LLM-as-Judge** - Uses `lm_discriminator.py` pattern for planning/api tasks
+
+**Key Data Flow**:
+```
+Agent → Environment.step(action) → Observation → Agent
+                           ↓
+                    AnswerVerifier (3 modes)
+                           ↓
+                    SandboxPool (Docker)
+```
+
+**Training Data**: `data/claude_evolved_4gen/final_evolved_v1.0_complete.json`
+- 2858 total prompts across 4 domains
+- 510 code_debug tasks with reference solutions
+- 351 code_debug tasks sandbox-verified (reference_solution + test_cases + validation passed)
+
 ### Rate Limiting Patterns
 For Claude API evolution runs:
 - Wrap `client.achat` with random sleep (12-18s by default) before each request
@@ -300,6 +349,13 @@ Evolved prompts (`data/evolved/generation_*.json`) have a slightly different str
 - Test cases are preserved but may not match the evolved prompt
 
 Use `quality_assessment.py` with evolved data for pipeline statistics, but note it expects full seed structure.
+
+**Final Evolved Dataset**:
+- `data/claude_evolved_4gen/final_evolved_v1.0_complete.json` - 2858 prompts across 4 domains with reference solutions for RL training:
+  - `code_debug`: 510 tasks (351 sandbox-validated)
+  - `math_reasoning`: 769 tasks (includes `final_answer` field)
+  - `api_orchestration`: 767 tasks
+  - `multi_step_planning`: 812 tasks
 
 ## Environment Variables
 
@@ -344,6 +400,12 @@ Use `quality_assessment.py` with evolved data for pipeline statistics, but note 
 | `src/infra/anthropic_client/client.py` | Volcano Claude native API client |
 | `src/infra/vllm_client/client.py` | vLLM OpenAI-compatible client |
 | `src/infra/sandbox/execution_manager.py` | Docker sandbox code execution |
+| **RL Environment** | |
+| `src/infra/environment/environment.py` | Main `env.step()` interface |
+| `src/infra/environment/sandbox_pool.py` | Docker container pool manager |
+| `src/infra/environment/answer_verifier.py` | 3-mode answer validator |
+| `src/infra/environment/models.py` | Action/Observation/StepResult Pydantic models |
+| `tests/infra/environment/test_environment.py` | 31 unit tests (10 code + 5 math end-to-end) |
 
 ## Development Rules (Project-Specific)
 
@@ -365,11 +427,39 @@ Enabled categories: `E`, `W`, `F`, `I`, `N`, `UP`, `B`, `SIM`, `TCH`
 Specific ignores: `E501` (line too long), `B008` (allows mutable defaults)
 
 ## Testing Structure
-- **`tests/validation/`** - Unit tests for core modules, can run offline
-- **`tests/test_*.py`** - Integration tests, may require Docker/GPU/API tokens
-- **`MockLLMClient`** - Built into `run_evolution.py` for offline testing without real LLM calls
 
-Use `--use-mock` flag with `run_evolution.py` to validate pipeline logic without API calls.
+```
+tests/
+├── validation/               # ✅ OFFLINE - Unit tests, no external dependencies
+│   ├── test_seed_pool.py     # SeedPromptPool weighted sampling, I/O, versioning
+│   ├── test_task_generator.py # TaskGenerator, validators, function parsing
+│   └── test_task_validation.py # TaskValidation pipeline
+├── infra/environment/
+│   └── test_environment.py   # 🐳 REQUIRES DOCKER - 31 RL env tests (10 code + 5 math E2E)
+├── test_vllm_client.py       # 🐳 REQUIRES DOCKER - vLLM Docker integration
+├── test_volcano_claude.py    # 🔑 REQUIRES API KEY - Volcano Claude endpoint
+├── test_volcano_claude_native.py
+├── test_unified_client.py
+└── test_local_llm.py         # ✅ OFFLINE - Local HuggingFace transformers
+```
+
+- **`MockLLMClient`** - Built into `run_evolution.py` for offline testing without real LLM calls
+- Use `--use-mock` flag with `run_evolution.py` to validate pipeline logic without API calls
+
+## Script Inventory
+
+| Script | Purpose | Requires |
+|--------|---------|----------|
+| `start_vllm_docker.sh` | Start vLLM Docker service (respects `VLLM_MODE`) | Docker + GPU |
+| `stop_vllm_docker.sh` | Stop vLLM containers | Docker |
+| `verify_vllm.sh` | 6-point validation suite (health, model load, inference) | Docker + vLLM running |
+| `pull_vllm_image.sh` | Pre-pull GHCR image for faster startup | Docker |
+| `run_evolution.py` | Evol-Instruct pipeline (4 gens, 3 variants/seed) | LLM API (or mock) |
+| `generate_seed_prompts.py` | Regenerate 200 seed prompts | LLM API |
+| `demo_task_generator.py` | Demo task generation pipeline | LLM API |
+| `demo_task_validation.py` | Demo sandbox code execution validation | Docker |
+| `quality_assessment.py` | Seed quality scoring + filtering pipeline | LLM API (optional) |
+| `assess_evolution.py` | Evolution statistics for generation data | None |
 
 ## Reproducibility Guarantees
 1. **SHA256 Digest Locked Base Images** - All Docker base images pinned by digest

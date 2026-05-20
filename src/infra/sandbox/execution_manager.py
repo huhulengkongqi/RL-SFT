@@ -51,6 +51,7 @@ class SandboxExecutor:
                 'working_dir': '/app',
                 'mem_limit': f"{self.config.memory_limit}m",
                 'memswap_limit': f"{self.config.disk_limit}m",
+                'entrypoint': ['tail', '-f', '/dev/null'],  # Keep container running without default entrypoint
             }
 
             if not self.config.network_access:
@@ -179,6 +180,7 @@ class SandboxExecutor:
     async def _execute_in_container(self, container, code: str, timeout: int) -> ExecutionResult:
         """Execute code in container with timeout"""
         script_path = "/tmp/execute.py"
+        start_time = time.time()
 
         # Write code to file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
@@ -186,61 +188,61 @@ class SandboxExecutor:
             temp_file = f.name
 
         try:
-            # Copy script to container
-            with open(temp_file, 'rb') as f:
-                container.put_archive('/tmp', (script_path, f.read()))
-
-            # Execute script
-            exec_cmd = f"python {script_path}"
+            # Copy script to container using exec_run and echo
+            # Create simple script file directly in container
+            escaped_code = code.replace("'", "'\\''")
             result = container.exec_run(
-                cmd=exec_cmd,
+                cmd=f"sh -c 'cat > {script_path} << \"EOF\"\n{escaped_code}\nEOF'",
                 stdout=True,
                 stderr=True,
-                demux=True,
-                socket=True,
-                workdir='/app'
             )
+            if result.exit_code != 0:
+                return ExecutionResult.error(
+                    f"Failed to create script: {result.output.decode()}",
+                    time.time() - start_time,
+                )
 
-            # Read output with timeout
-            stdout = []
-            stderr = []
-            start_time = time.time()
+            # Execute script with timeout using async wait
+            exec_cmd = f"python3 {script_path}"
+            exec_start = time.time()
+
+            def run_exec():
+                return container.exec_run(
+                    cmd=exec_cmd,
+                    stdout=True,
+                    stderr=True,
+                    demux=True,
+                    workdir='/app'
+                )
 
             try:
-                for chunk in result.output.iter_bytes():
-                    if time.time() - start_time > timeout:
-                        result.close()
-                        break
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(run_exec),
+                    timeout=timeout
+                )
+                exec_time = time.time() - exec_start
 
-                    chunk_str = chunk.decode('utf-8', errors='replace')
-                    if result.output._stdout is not None:
-                        stdout.append(chunk_str)
-                    if result.output._stderr is not None:
-                        stderr.append(chunk_str)
+                # result.output is a tuple (stdout, stderr) when demux=True
+                stdout_bytes, stderr_bytes = result.output
+                stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
+                stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
 
-            except Exception:
-                # Timeout or other error
-                result.close()
-                return ExecutionResult.timeout(time.time() - start_time)
-
-            # Check exit code
-            if result.exit_code is not None:
                 if result.exit_code == 0:
-                    output = ''.join(stdout)
                     return ExecutionResult.success(
-                        output=output,
-                        execution_time=time.time() - start_time
+                        output=stdout,
+                        execution_time=exec_time
                     )
                 else:
-                    error = ''.join(stderr) or 'Execution failed'
                     return ExecutionResult.failure(
-                        error=error,
-                        execution_time=time.time() - start_time,
-                        traceback=''.join(stderr)
+                        error=stderr or 'Execution failed',
+                        execution_time=exec_time,
+                        traceback=stderr
                     )
+            except asyncio.TimeoutError:
+                return ExecutionResult.timeout(time.time() - exec_start)
 
         except Exception as e:
-            return ExecutionResult.error(str(e), time.time() - start_time)
+            return ExecutionResult.create_error(str(e), time.time() - start_time)
 
         finally:
             os.unlink(temp_file)

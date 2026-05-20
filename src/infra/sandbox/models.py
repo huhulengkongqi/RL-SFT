@@ -78,7 +78,7 @@ class ExecutionResult:
         )
 
     @classmethod
-    def error(cls, error: str, execution_time: float):
+    def create_error(cls, error: str, execution_time: float):
         return cls(
             status=ExecutionStatus.ERROR,
             error=error,
