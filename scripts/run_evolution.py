@@ -167,9 +167,12 @@ async def main():
         from infra.vllm_client.client import VLLMClient
         from agent_sft.evol_instruct.evolver import EvolInstructConfig
 
-        # Volcano Claude config from test_volcano_claude.py (OpenAI compatible)
-        base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
-        api_key = "***REMOVED***"
+        # Volcano Claude config (OpenAI compatible)
+        base_url = os.environ.get("VOLCANO_CLAUDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
+        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+
+        if not api_key:
+            raise ValueError("Please set ANTHROPIC_AUTH_TOKEN environment variable to use Claude mode")
 
         print(f"[Claude Mode] Using Volcano Claude API (OpenAI compatible)")
         print(f"   Base URL: {base_url}")

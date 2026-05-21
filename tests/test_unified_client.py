@@ -42,10 +42,14 @@ def test_volcano_claude():
     print("🔷 使用火山 Claude API (ark-code-latest)")
     print("=" * 60)
 
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = "***REMOVED***"
+    # ANTHROPIC_AUTH_TOKEN 从环境变量读取, 不要硬编码!
+
+    if not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        print("❌ 请先设置 ANTHROPIC_AUTH_TOKEN 环境变量")
+        return
 
     client = AnthropicClient(
-        base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+        base_url=os.environ.get("VOLCANO_CLAUDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"),
         sleep_before_request=1,
         sleep_after_request=1,
     )

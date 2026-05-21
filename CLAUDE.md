@@ -12,11 +12,32 @@ Agentic RL SFT Data Synthesis Pipeline — generates SFT training data for agent
 
 Core modules (`task_generator`, `evol_instruct`, `quality_filter`, `sandbox`) are fully implemented.
 
+## Quick Start
+
+```bash
+# 1. Configure environment
+cp .env.example .env
+# Edit .env with your HF_TOKEN and API keys
+
+# 2. Install dependencies
+uv sync
+
+# 3. Start vLLM Docker service (fastest mode)
+./scripts/start_vllm_docker.sh
+
+# 4. Verify service (6-point validation suite)
+./scripts/verify_vllm.sh
+
+# 5. Run pipeline (test with mock LLM)
+uv run python scripts/run_evolution.py --use-mock
+```
+
 ## Prerequisites
 
 - Python 3.11+
 - `uv` package manager
-- NVIDIA driver ≥ 550.x (CUDA 12.4+) for GPU inference
+- **NVIDIA driver ≥ 550.x** (CUDA 12.4+) for GPU inference
+- **6GB+ VRAM** required for AWQ-quantized 7B models
 - Docker + NVIDIA Container Toolkit for vLLM Docker deployment
 
 ## Commands
@@ -113,6 +134,22 @@ docker compose down
 ```bash
 # Start local vLLM with small model for testing
 uv run python scripts/start_local_vllm.py
+```
+
+#### Remote vLLM Server
+If you have a remote vLLM server, set in `.env`:
+```
+VLLM_BASE_URL=http://your-server:8000/v1
+```
+
+#### WSL2 Local Installation (Native CUDA)
+```bash
+# Direct pip install in WSL2 for better CUDA compatibility
+pip install vllm
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+  --gpu-memory-utilization 0.85 \
+  --quantization awq
 ```
 
 ### Evol-Instruct Pipeline
@@ -213,7 +250,7 @@ All three clients (`VLLMClient`, `AnthropicClient`, `LocalLLMClient`) share a du
 ### LLM Client Selection Guide
 | Client | Use Case | Pros | Cons |
 |--------|----------|------|------|
-| **VLLMClient** | Local GPU inference with vLLM Docker | Fast, no rate limits, OpenAI-compatible | Requires GPU ≥ 16GB VRAM |
+| **VLLMClient** | Local GPU inference with vLLM Docker | Fast, no rate limits, OpenAI-compatible | Requires GPU ≥ 6GB VRAM (for AWQ 7B models) |
 | **AnthropicClient** | Volcano Claude API (China region) | High quality, thinking mode support | Rate limited, requires API token |
 | **LocalLLMClient** | Direct HuggingFace transformers | CPU/GPU compatible, no server needed | Slower, memory intensive |
 
@@ -331,6 +368,34 @@ For Claude API evolution runs:
 - Wrap `client.achat` with random sleep (12-18s by default) before each request
 - Set `max_concurrent_requests=1` for serialized execution
 - Use `discriminator_min_score` filtering to reduce unnecessary API calls
+
+### Seed Pool API Quick Reference
+
+```python
+from src.agent_sft.task_generator.seed_pool import SeedPromptPool
+from src.agent_sft.task_generator.models import Domain, Difficulty
+
+pool = SeedPromptPool.load("data/seed_prompts.json")
+
+# Sample by domain/difficulty
+code_seeds = pool.sample(count=10, domain=Domain.CODE_DEBUG)
+hard_api_seeds = pool.sample(count=5, domain=Domain.API_ORCHESTRATION, difficulty=Difficulty.HARD)
+
+# Weighted sampling (higher quality seeds sampled more often)
+high_quality_seeds = pool.sample(count=20, weight_by_quality=True)
+
+# Avoid duplicate sampling across batches
+batch1 = pool.sample(count=10, avoid_duplicates=True)
+batch2 = pool.sample(count=10, avoid_duplicates=True)
+pool.reset_sampling()
+
+# Version management
+pool.bump_version("v1.1")
+print(pool.get_version_history())
+
+# Statistics
+stats = pool.get_stats()  # {total_prompts, by_domain, by_difficulty, avg_quality_score}
+```
 
 ### Data Structure
 Seed prompts are stored in `data/seed_prompts.json` with 200 high-quality prompts across 4 domains:

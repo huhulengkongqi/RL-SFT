@@ -3,10 +3,10 @@
 import os
 
 # ==============================================
-# 环境变量配置 (也可以在系统环境中设置)
+# 环境变量配置 (请在 .env 文件或系统环境中设置)
 # ==============================================
-os.environ["ANTHROPIC_AUTH_TOKEN"] = "***REMOVED***"
-os.environ["VOLCANO_CLAUDE_BASE_URL"] = "https://ark.cn-beijing.volces.com/api/coding/v3"
+# ANTHROPIC_AUTH_TOKEN 应从环境变量读取, 不要在这里硬编码!
+os.environ["VOLCANO_CLAUDE_BASE_URL"] = os.environ.get("VOLCANO_CLAUDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
 os.environ["API_TIMEOUT_MS"] = "3000000"
 os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
@@ -28,10 +28,10 @@ def main():
         # 方式1: 使用工厂函数 (最简单，推荐)
         client = create_volcano_claude_client(sleep_before=10, sleep_after=10)
 
-        # 方式2: 手动创建 (更灵活)
+        # 方式2: 手动创建 (更灵活) - api_key 从环境变量读取
         # client = AnthropicClient(
         #     base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
-        #     api_key="***REMOVED***",
+        #     api_key=os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
         #     sleep_before_request=10,
         #     sleep_after_request=10,
         # )

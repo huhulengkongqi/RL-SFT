@@ -10,10 +10,10 @@ os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 from src.infra.vllm_client.client import VLLMClient
 
 # ==============================================
-# 请在此处填入你的配置信息
+# 配置信息 (从环境变量读取, 或在 .env 文件中设置)
 # ==============================================
-BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"  # 例如: "https://api.volcengine.com/api/v1"
-API_KEY = "***REMOVED***"   # 你的火山Claude API Key
+BASE_URL = os.environ.get("VOLCANO_CLAUDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
+API_KEY = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")  # 从环境变量读取 API Key
 MODEL_NAME = "ark-code-latest"  # 模型名称, 例如: "claude-3-sonnet"
 # ==============================================
 
