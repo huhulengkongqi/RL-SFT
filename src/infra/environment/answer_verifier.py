@@ -256,20 +256,35 @@ class MathEquationVerifier(BaseVerifier):
                     details={"match_type": "exact_string"},
                 )
 
-            # Try numeric comparison
+            # Try numeric comparison with tolerance and rounding compatibility
             try:
-                answer_num = float(answer_str)
-                truth_num = float(truth_str)
+                def _clean_numeric(value: str) -> tuple[float, int]:
+                    raw = value.replace(",", "").strip()
+                    percent = raw.endswith("%")
+                    raw = raw[:-1].strip() if percent else raw
+                    match = re.search(r"-?\d+(?:\.\d+)?", raw)
+                    if not match:
+                        raise ValueError(f"No numeric value in {value!r}")
+                    token = match.group(0)
+                    decimals = len(token.split(".", 1)[1]) if "." in token else 0
+                    number = float(token)
+                    return number, decimals
+
+                answer_num, answer_decimals = _clean_numeric(answer_str)
+                truth_num, truth_decimals = _clean_numeric(truth_str)
                 diff = abs(answer_num - truth_num)
-                if diff <= self.tolerance:
+                rounding_decimals = max(answer_decimals, truth_decimals)
+                rounded_equal = round(answer_num, rounding_decimals) == round(truth_num, rounding_decimals)
+                if diff <= self.tolerance or rounded_equal:
                     return VerificationResult(
                         mode=VerificationMode.MATH_EQUATION,
                         passed=True,
                         score=1.0,
                         details={
-                            "match_type": "numeric",
+                            "match_type": "numeric" if diff <= self.tolerance else "rounded_numeric",
                             "difference": diff,
                             "tolerance": self.tolerance,
+                            "rounding_decimals": rounding_decimals,
                         },
                     )
             except (ValueError, TypeError):

@@ -126,7 +126,7 @@ class SandboxExecutor:
                     success = await self.install_requirements(container, request.requirements)
                     if not success:
                         return SandboxExecutionResponse(
-                            execution_result=ExecutionResult.error(
+                            execution_result=ExecutionResult.create_error(
                                 "Failed to install requirements",
                                 time.time() - start_time
                             ),
@@ -168,7 +168,7 @@ class SandboxExecutor:
 
         except Exception as e:
             return SandboxExecutionResponse(
-                execution_result=ExecutionResult.error(str(e), time.time() - start_time),
+                execution_result=ExecutionResult.create_error(str(e), time.time() - start_time),
                 test_results=[],
                 passed_tests=0,
                 total_tests=len(request.test_cases),
@@ -183,7 +183,7 @@ class SandboxExecutor:
         start_time = time.time()
 
         # Write code to file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
             f.write(code)
             temp_file = f.name
 
@@ -197,7 +197,7 @@ class SandboxExecutor:
                 stderr=True,
             )
             if result.exit_code != 0:
-                return ExecutionResult.error(
+                return ExecutionResult.create_error(
                     f"Failed to create script: {result.output.decode()}",
                     time.time() - start_time,
                 )

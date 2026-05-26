@@ -1,7 +1,10 @@
 """Environment core interface for agent action-observation loop."""
 
+import ast
 import asyncio
+import json
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from .answer_verifier import AnswerVerifier
@@ -14,6 +17,7 @@ from .models import (
     StepResult,
     ToolCallAction,
     VerificationMode,
+    VerificationResult,
 )
 from .sandbox_pool import SandboxPool
 
@@ -35,10 +39,14 @@ class Environment:
         self,
         sandbox_pool: Optional[SandboxPool] = None,
         max_steps: int = 10,
+        judge_client: Optional[Any] = None,
+        judge_model: Optional[str] = None,
     ):
         self.sandbox_pool = sandbox_pool or SandboxPool()
         self.answer_verifier = AnswerVerifier(self.sandbox_pool)
         self.max_steps = max_steps
+        self.judge_client = judge_client
+        self.judge_model = judge_model
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -49,6 +57,178 @@ class Environment:
         self.history: list[StepResult] = []
         self._test_cases_passed = 0
         self._test_cases_total = 0
+
+    @staticmethod
+    def _extract_python_code(answer: Any) -> Any:
+        """Extract executable Python code from a final answer if it contains fenced code blocks."""
+        if not isinstance(answer, str):
+            return answer
+        matches = re.findall(r"```(?:python)?\s*\n(.*?)```", answer, flags=re.IGNORECASE | re.DOTALL)
+        if matches:
+            return "\n\n".join(block.strip() for block in matches if block.strip())
+        return answer
+
+    @staticmethod
+    def _extract_math_answer(answer: Any) -> Any:
+        """Extract the final numeric value from a verbose math answer."""
+        if not isinstance(answer, str):
+            return answer
+        text = answer.replace(",", "")
+        explicit = re.findall(r"(?:answer is|answer:|=)\s*(-?\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+        if explicit:
+            return explicit[-1]
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", text)
+        return numbers[-1] if numbers else answer
+
+    async def _llm_judge_answer(self, task_domain: str, answer: Any) -> VerificationResult:
+        """Use optional LLM-as-Judge for open-ended final answers."""
+        if self.judge_client is None:
+            return VerificationResult(
+                mode=VerificationMode.FORMAT_VALIDATION,
+                passed=False,
+                score=0.0,
+                details={"judge_skipped": "no_judge_client"},
+                error="LLM judge client is not configured",
+            )
+
+        prompt = f"""You are a strict answer judge for agent trajectory data.
+
+Task domain: {task_domain}
+
+Task prompt:
+{self.current_task.get('prompt', '') if self.current_task else ''}
+
+Candidate final answer:
+{answer}
+
+Judge whether the candidate answer correctly solves the task.
+For code_debug: check root cause, fixed code, and explanation.
+For api_orchestration: check endpoint/order/auth/error handling/completeness.
+For multi_step_planning: check ordered steps/dependencies/risks/completeness.
+
+Return ONLY valid JSON:
+{{
+  "passed": true or false,
+  "score": 0.0 to 1.0,
+  "reason": "short reason",
+  "missing_or_wrong": ["item1", "item2"]
+}}
+"""
+        raw = await self.judge_client.achat(
+            model=self.judge_model or getattr(self.judge_client, "model", "default"),
+            messages=[
+                {"role": "system", "content": "You are a strict verification judge. Output valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        try:
+            text = raw.strip()
+            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+            text = re.sub(r"```$", "", text).strip()
+            match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            parsed = json.loads(match.group(0) if match else text)
+            score = float(parsed.get("score", 0.0))
+            passed = bool(parsed.get("passed", False)) and score >= 0.7
+            return VerificationResult(
+                mode=VerificationMode.FORMAT_VALIDATION,
+                passed=passed,
+                score=score,
+                details={"llm_judge": parsed, "raw_response": raw},
+                error=None if passed else parsed.get("reason", "LLM judge rejected answer"),
+            )
+        except Exception as e:
+            return VerificationResult(
+                mode=VerificationMode.FORMAT_VALIDATION,
+                passed=False,
+                score=0.0,
+                details={"raw_response": raw, "parse_error": str(e)},
+                error=f"LLM judge response parse failed: {e}",
+            )
+
+    @staticmethod
+    def _wrap_script_as_solution(code: str) -> str:
+        """Wrap executable script-style final code into a solution(**kwargs) function."""
+        indented = "\n".join(f"    {line}" if line.strip() else "" for line in str(code).splitlines())
+        return (
+            "def solution(**kwargs):\n"
+            "    globals().update(kwargs)\n"
+            f"{indented}\n"
+            "    for _name in ('result', 'answer', 'output', 'customer_spending'):\n"
+            "        if _name in locals():\n"
+            "            return locals()[_name]\n"
+            "    return None\n"
+        )
+
+    def _find_successful_exec_evidence(self, final_answer: Any, extracted_code: Any) -> Optional[Dict[str, Any]]:
+        """Find prior successful exec tool calls as evidence for code_debug final answer."""
+        answer_text = str(final_answer)
+        extracted_text = str(extracted_code or "")
+        for step in reversed(self.history):
+            action = step.action
+            observation = step.observation
+            if not isinstance(action, ToolCallAction) or action.name != "exec" or not observation.success:
+                continue
+            executed_code = str(action.kwargs.get("code") or (action.args[0] if action.args else ""))
+            if not executed_code.strip():
+                continue
+            executed_functions = re.findall(r"def\s+([A-Za-z_]\w*)\s*\(", executed_code)
+            shared_function = any(f"def {name}" in answer_text or f"def {name}" in extracted_text for name in executed_functions)
+            substantial_overlap = len(set(executed_code.split()) & set(extracted_text.split())) >= 20 if extracted_text else False
+            if shared_function or substantial_overlap:
+                return {
+                    "matched": True,
+                    "step": step.step,
+                    "executed_functions": executed_functions,
+                    "observation_content": observation.content,
+                    "observation_metadata": observation.metadata,
+                }
+        return None
+
+    @staticmethod
+    def _infer_function_name(code: Any, answer: Any = None) -> str:
+        """Infer target function name from extracted code/final answer for code_debug verification."""
+        code_text = str(code or "")
+        try:
+            tree = ast.parse(code_text)
+            functions = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+            if "solution" in functions:
+                return "solution"
+            if functions:
+                return functions[-1]
+        except SyntaxError:
+            pass
+
+        text = f"{answer or ''}\n{code_text}"
+        matches = re.findall(r"def\s+([A-Za-z_]\w*)\s*\(", text)
+        if "solution" in matches:
+            return "solution"
+        return matches[-1] if matches else "solution"
+
+    @staticmethod
+    def _verify_code_debug_answer(answer: Any, expected_output: Any) -> tuple[bool, float, Dict[str, Any]]:
+        """Validate code_debug final answers as debugging reports, not always executable solution() functions."""
+        text = str(answer)
+        expected_keys = list(expected_output.keys()) if isinstance(expected_output, dict) else []
+        required = expected_keys or ["root_cause", "fixed_code", "explanation"]
+        checks: Dict[str, bool] = {}
+
+        lower = text.lower()
+        if "root_cause" in required:
+            checks["root_cause"] = any(token in lower for token in ["root cause", "cause", "bug", "issue", "原因", "根因", "问题"])
+        if "fixed_code" in required:
+            checks["fixed_code"] = bool(re.search(r"```(?:python)?\s*\n.*?```", text, flags=re.IGNORECASE | re.DOTALL) or "def " in text or "class " in text)
+        if "explanation" in required:
+            checks["explanation"] = any(token in lower for token in ["explanation", "explain", "because", "fix", "修复", "说明", "解释"])
+
+        for key in required:
+            checks.setdefault(key, key in lower or key in text)
+
+        passed_count = sum(1 for value in checks.values() if value)
+        total = len(checks) or 1
+        score = passed_count / total
+        return score >= 1.0, score, {"checks": checks, "required_fields": required}
 
     def reset(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -152,9 +332,12 @@ class Environment:
         # Determine verification mode based on task domain
         verification_mode: Optional[VerificationMode] = None
         verify_kwargs = {}
+        answer_for_verification = action.answer
+        verification_result = None
 
         if task_domain in {"math", "math_reasoning", "arithmetic", "algebra"}:
             verification_mode = VerificationMode.MATH_EQUATION
+            answer_for_verification = self._extract_math_answer(action.answer)
             # Extract ground truth from first test case
             if test_cases:
                 ground_truth = test_cases[0].get("expected_output", "")
@@ -164,25 +347,111 @@ class Environment:
                 verify_kwargs["expression"] = True
 
         elif task_domain in {"code", "coding", "code_debug", "programming"}:
-            verification_mode = VerificationMode.CODE_EXECUTION
-            verify_kwargs["test_cases"] = test_cases
-            # Try to extract function name from the solution code
-            # Default to 'solution' if not specified
-            verify_kwargs["function_name"] = "solution"
+            expected_output = test_cases[0].get("expected_output", {}) if test_cases else {}
+            extracted_code = self._extract_python_code(action.answer)
+
+            inferred_function_name = self._infer_function_name(extracted_code, action.answer)
+            code_result = await self.answer_verifier.verify(
+                extracted_code,
+                mode=VerificationMode.CODE_EXECUTION,
+                test_cases=test_cases,
+                function_name=inferred_function_name,
+            )
+
+            wrapped_function_name = None
+            if not code_result.passed:
+                error_text = str(code_result.details.get("error", "")) + str(code_result.details.get("test_details", ""))
+                if "not defined" in error_text or inferred_function_name == "solution":
+                    wrapped_code = self._wrap_script_as_solution(extracted_code)
+                    wrapped_function_name = "solution"
+                    wrapped_result = await self.answer_verifier.verify(
+                        wrapped_code,
+                        mode=VerificationMode.CODE_EXECUTION,
+                        test_cases=test_cases,
+                        function_name=wrapped_function_name,
+                    )
+                    if wrapped_result.score >= code_result.score:
+                        code_result = wrapped_result
+
+            exec_evidence = self._find_successful_exec_evidence(action.answer, extracted_code)
+            report_fields = {"root_cause", "fixed_code", "explanation"}
+            expected_keys = set(expected_output.keys()) if isinstance(expected_output, dict) else set()
+            can_fallback_to_report = bool(expected_keys & report_fields)
+
+            if code_result.passed:
+                verification_mode = VerificationMode.CODE_EXECUTION
+                details = dict(code_result.details)
+                details["inferred_function_name"] = inferred_function_name
+                details["wrapped_function_name"] = wrapped_function_name
+                verification_result = VerificationResult(
+                    mode=code_result.mode,
+                    passed=code_result.passed,
+                    score=code_result.score,
+                    details=details,
+                    error=code_result.error,
+                )
+                answer_for_verification = extracted_code
+            elif can_fallback_to_report:
+                verification_mode = VerificationMode.FORMAT_VALIDATION
+                passed, score, details = self._verify_code_debug_answer(action.answer, expected_output)
+                judge_result = await self._llm_judge_answer(task_domain, action.answer)
+                details["inferred_function_name"] = inferred_function_name
+                details["wrapped_function_name"] = wrapped_function_name
+                details["code_execution"] = code_result.details
+                details["successful_exec_evidence"] = exec_evidence
+                details["llm_judge"] = judge_result.details
+                evidence_passed = exec_evidence is not None
+                combined_score = min(score, judge_result.score)
+                if evidence_passed:
+                    combined_score = max(combined_score, min(1.0, (score + judge_result.score + 1.0) / 3))
+                fallback_passed = passed and judge_result.passed and evidence_passed
+                verification_result = VerificationResult(
+                    mode=verification_mode,
+                    passed=fallback_passed,
+                    score=combined_score,
+                    details=details,
+                    error=None if fallback_passed else "code execution failed and fallback format/judge/evidence validation did not fully pass",
+                )
+                answer_for_verification = action.answer
+            else:
+                verification_mode = VerificationMode.CODE_EXECUTION
+                details = dict(code_result.details)
+                details["inferred_function_name"] = inferred_function_name
+                details["wrapped_function_name"] = wrapped_function_name
+                verification_result = VerificationResult(
+                    mode=code_result.mode,
+                    passed=code_result.passed,
+                    score=code_result.score,
+                    details=details,
+                    error=code_result.error,
+                )
+                answer_for_verification = extracted_code
         else:
-            # For open-ended tasks, use format validation
+            # For open-ended tasks, use format validation + optional LLM judge
             verification_mode = VerificationMode.FORMAT_VALIDATION
             if test_cases and isinstance(test_cases[0].get("expected_output"), dict):
                 verify_kwargs["required_fields"] = list(
                     test_cases[0]["expected_output"].keys()
                 )
 
-        # Run verification
-        verification_result = await self.answer_verifier.verify(
-            action.answer,
-            mode=verification_mode,
-            **verify_kwargs,
-        )
+        # Run verification unless domain-specific logic already produced a result
+        if verification_result is None:
+            verification_result = await self.answer_verifier.verify(
+                answer_for_verification,
+                mode=verification_mode,
+                **verify_kwargs,
+            )
+            if task_domain in {"api_orchestration", "multi_step_planning"}:
+                judge_result = await self._llm_judge_answer(task_domain, action.answer)
+                details = dict(verification_result.details)
+                details["llm_judge"] = judge_result.details
+                verification_result = VerificationResult(
+                    mode=verification_mode,
+                    passed=verification_result.passed and judge_result.passed,
+                    score=min(verification_result.score, judge_result.score),
+                    details=details,
+                    error=None if verification_result.passed and judge_result.passed else "format validation or LLM judge failed",
+                )
 
         # Update test case tracking
         if verification_result.details.get("tests_passed") is not None:
@@ -200,6 +469,7 @@ class Environment:
                 metadata={
                     "verification_mode": verification_mode,
                     "verification_score": verification_result.score,
+                    "answer_for_verification": answer_for_verification,
                 },
             ),
             done=True,

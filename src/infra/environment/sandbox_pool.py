@@ -175,7 +175,7 @@ class SandboxPool:
                 )
                 if not success:
                     return SandboxExecutionResponse(
-                        execution_result=ExecutionResult.error(
+                        execution_result=ExecutionResult.create_error(
                             "Failed to install requirements",
                             time.time() - start_time,
                         ),
@@ -215,7 +215,7 @@ class SandboxPool:
         except Exception as e:
             logger.error(f"Execution error in pooled container: {e}")
             return SandboxExecutionResponse(
-                execution_result=ExecutionResult.error(
+                execution_result=ExecutionResult.create_error(
                     str(e), time.time() - start_time
                 ),
                 test_results=[],

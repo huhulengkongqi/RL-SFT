@@ -25,6 +25,7 @@ CODE_TASKS: List[Dict[str, Any]] = [
     {
         "id": "code_task_1",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "easy",
         "prompt": "Write a function add(a, b) that returns the sum of a and b.",
         "test_cases": [
@@ -41,6 +42,7 @@ def solution(a, b):
     {
         "id": "code_task_2",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "easy",
         "prompt": "Write a function reverse_string(s) that returns the reversed string.",
         "test_cases": [
@@ -57,6 +59,7 @@ def solution(s):
     {
         "id": "code_task_3",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "easy",
         "prompt": "Write a function filter_evens(numbers) that returns only even numbers.",
         "test_cases": [
@@ -73,6 +76,7 @@ def solution(numbers):
     {
         "id": "code_task_4",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "medium",
         "prompt": "Write a function sum_values(d) that returns the sum of all values in a dictionary.",
         "test_cases": [
@@ -89,6 +93,7 @@ def solution(d):
     {
         "id": "code_task_5",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "medium",
         "prompt": "Write a function sort_by_length(strings) that sorts strings by length.",
         "test_cases": [
@@ -103,6 +108,7 @@ def solution(strings):
     {
         "id": "code_task_6",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "medium",
         "prompt": "Write a function fib(n) that returns the nth Fibonacci number.",
         "test_cases": [
@@ -121,6 +127,7 @@ def solution(n):
     {
         "id": "code_task_7",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "medium",
         "prompt": "Write a function safe_divide(a, b) that returns a/b or None on division by zero.",
         "test_cases": [
@@ -139,6 +146,7 @@ def solution(a, b):
     {
         "id": "code_task_8",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "hard",
         "prompt": "Write a class Counter with increment() and get_count() methods.",
         "test_cases": [
@@ -160,6 +168,7 @@ class Counter:
     {
         "id": "code_task_9",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "medium",
         "prompt": "Write a function count_lines(text) that counts the number of lines in a string.",
         "test_cases": [
@@ -175,6 +184,7 @@ def solution(text):
     {
         "id": "code_task_10",
         "domain": "code",
+        "function_name": "solution",
         "difficulty": "medium",
         "prompt": "Write a function format_response(status, data) that returns a dict.",
         "test_cases": [
