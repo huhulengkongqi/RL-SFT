@@ -2,11 +2,31 @@
 
 from .lm_discriminator import LMDiscriminator, LMDiscriminatorResult
 from .metrics import DiversityMetrics, calculate_diversity_stats
+from .quality_filter import (
+    DEDUP_TEXT_PRESETS,
+    DeduplicatorMinhash,
+    DedupTextConfig,
+    DiversityMonitor,
+    QualityFilter,
+    QualityFilterConfig,
+    ResultVerifier,
+    StageResult,
+    TrajectoryRecord,
+)
 
 __all__ = [
+    "DEDUP_TEXT_PRESETS",
+    "DeduplicatorMinhash",
+    "DedupTextConfig",
+    "DiversityMetrics",
+    "DiversityMonitor",
     "LMDiscriminator",
     "LMDiscriminatorResult",
-    "DiversityMetrics",
+    "QualityFilter",
+    "QualityFilterConfig",
+    "ResultVerifier",
+    "StageResult",
+    "TrajectoryRecord",
     "calculate_diversity_stats",
 ]
 
