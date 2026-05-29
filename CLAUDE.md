@@ -2,539 +2,162 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project
+## Project overview
 
-Agentic RL SFT Data Synthesis Pipeline — generates SFT training data for agentic RL cold-start via:
-1. **Task Generation** - Seed-based task generation with function call validation
-2. **Evol-Instruct Pipeline** - Multi-generational prompt evolution with 7 strategies
-3. **Quality Filtering** - Embedding deduplication + LLM-based quality discrimination
-4. **Sandbox Execution** - Docker-isolated code execution with test case validation
+This repository builds an Agentic RL SFT data synthesis pipeline. The main flow is:
 
-Core modules (`task_generator`, `evol_instruct`, `quality_filter`, `sandbox`) are fully implemented.
-
-## Quick Start
-
-```bash
-# 1. Configure environment
-cp .env.example .env
-# Edit .env with your HF_TOKEN and API keys
-
-# 2. Install dependencies
-uv sync
-
-# 3. Start vLLM Docker service (fastest mode)
-./scripts/start_vllm_docker.sh
-
-# 4. Verify service (6-point validation suite)
-./scripts/verify_vllm.sh
-
-# 5. Run pipeline (test with mock LLM)
-uv run python scripts/run_evolution.py --use-mock
+```text
+raw data → seed prompts → evolved tasks → reference/test enrichment → AgentLoop trajectories → SFT JSON
 ```
 
-## Prerequisites
+The project is not a model-training repo; it prepares high-quality task and trajectory data for agent cold-start training.
 
-- Python 3.11+
-- `uv` package manager
-- **NVIDIA driver ≥ 550.x** (CUDA 12.4+) for GPU inference
-- **6GB+ VRAM** required for AWQ-quantized 7B models
-- Docker + NVIDIA Container Toolkit for vLLM Docker deployment
+## Common commands
 
-## Commands
+### Setup
 
-### Installation & Setup
 ```bash
-# Install dependencies
 uv sync
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your HF_TOKEN and API keys
+cp .env.example .env  # if local credentials/config are needed
 ```
 
-### Testing
+Important env vars used by scripts:
+
+- `ANTHROPIC_AUTH_TOKEN`: Volcano/Claude-compatible API key.
+- `VOLCANO_CLAUDE_BASE_URL`: defaults to `https://ark.cn-beijing.volces.com/api/coding/v3` in scripts.
+- `VLLM_BASE_URL`: default local vLLM OpenAI-compatible endpoint, usually `http://localhost:8000/v1`.
+- `VLLM_MODEL`: default local model, usually `Qwen/Qwen2.5-7B-Instruct-AWQ`.
+
+### Tests
+
 ```bash
-# Run all tests
 uv run pytest
-
-# Run specific test file
-uv run pytest tests/test_task_generator.py -v
-uv run pytest tests/test_vllm_client.py -v
-uv run pytest tests/infra/environment/test_environment.py -v  # RL Environment tests
-
-# pytest configuration (pytest.ini):
-# - testpaths = tests
-# - pythonpath = src
-# - python_files = test_*.py
-# - python_classes = Test*
-# - python_functions = test_*
-# - addopts = -v --tb=short
-# - asyncio_mode = auto
-
-# Run specific test by name
-uv run pytest tests/validation/test_task_generator.py::TestTaskGenerator::test_seed_sampling -v
-
-# Run only offline validation tests (no Docker/GPU required)
-uv run pytest tests/validation/ -v
+uv run pytest tests/validation/ -v                         # offline validation tests
+uv run pytest tests/validation/test_seed_pool.py -v         # one test file
+uv run pytest tests/validation/test_seed_pool.py::TestSeedPromptPool::test_weighted_sampling -v
+uv run pytest tests/infra/environment/test_environment.py -v # requires Docker sandbox
+uv run pytest tests/test_agent_loop.py -v
+uv run pytest tests/test_trajectory_sample.py -v
 ```
 
-### Linting & Formatting
+`pytest.ini` sets `testpaths = tests`, `pythonpath = src`, verbose short tracebacks, and `asyncio_mode = auto`.
+
+### Lint, format, type check
+
 ```bash
-# Code formatting (ruff)
-uv run ruff format src/ tests/
-
-# Linting (ruff)
-uv run ruff check src/ tests/
-
-# Type checking (mypy)
+uv run ruff format src/ tests/ scripts/
+uv run ruff check src/ tests/ scripts/
 uv run mypy src/
 ```
 
-### vLLM Deployment (Docker)
+Ruff uses `ruff.toml`: 120-character line length, double quotes, isort first-party packages `agent_sft` and `infra`, and lint groups `E/W/F/I/N/UP/B/SIM/TCH` with `E501` and `B008` ignored.
 
-#### Fastest Mode (Recommended)
+### vLLM / sandbox utilities
+
 ```bash
-# Pre-pull image (~30 seconds)
-./scripts/pull_vllm_image.sh
-
-# Start vLLM Docker service
 ./scripts/start_vllm_docker.sh
-
-# Run 6-point validation suite
 ./scripts/verify_vllm.sh
-
-# Stop service
 ./scripts/stop_vllm_docker.sh
-```
-
-#### Direct Docker Compose
-
-Docker deployment mode is controlled by `VLLM_MODE` env var (set in `.env`) **and** compose profile flags:
-
-```bash
-# Pull mode (fastest) - VLLM_MODE=pull
-docker compose --profile pull up -d
-
-# With custom env
-HF_TOKEN=<token> docker compose --profile pull up
-VLLM_PORT=8001 docker compose --profile pull up
-
-# Build modes - VLLM_MODE=build or VLLM_MODE=full
-docker compose --profile build up --build  # ~2min
-docker compose --profile full up --build   # ~10min
-
-# View logs
-docker compose logs -f vllm
-
-# Stop
-docker compose down
-```
-
-#### Local Development vLLM
-```bash
-# Start local vLLM with small model for testing
 uv run python scripts/start_local_vllm.py
 ```
 
-#### Remote vLLM Server
-If you have a remote vLLM server, set in `.env`:
-```
-VLLM_BASE_URL=http://your-server:8000/v1
-```
+Docker is required for the real environment sandbox tests and demos. GPU/vLLM workflows additionally require NVIDIA Docker support and a compatible CUDA driver.
 
-#### WSL2 Local Installation (Native CUDA)
+## Pipeline scripts
+
 ```bash
-# Direct pip install in WSL2 for better CUDA compatibility
-pip install vllm
-python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen2.5-7B-Instruct-AWQ \
-  --gpu-memory-utilization 0.85 \
-  --quantization awq
-```
-
-### Evol-Instruct Pipeline
-```bash
-# Run full evolution pipeline (4 generations, 3 evolutions per seed)
-uv run python scripts/run_evolution.py
-
-# Custom evolution parameters
-uv run python scripts/run_evolution.py --generations 8 --evolutions-per-seed 5
-
-# Test with mock LLM (no real LLM required)
-uv run python scripts/run_evolution.py --use-mock
-
-# Output: data/evolved/final_evolved.json + statistics
-```
-
-### Demo & Utility Scripts
-```bash
-# Demo task generation
-uv run python scripts/demo_task_generator.py
-
-# Demo task validation with sandbox execution
-uv run python scripts/demo_task_validation.py
-
-# Regenerate 200 seed prompts
+# Generate/assess seed and evolved prompt data
 uv run python scripts/generate_seed_prompts.py
+uv run python scripts/run_evolution.py --use-mock
+uv run python scripts/run_evolution.py --seed-file data/final_seed_pool_181_real.json --generations 4 --evolutions-per-seed 3 --output-dir data/evolved
+uv run python scripts/assess_evolution.py data/evolved/final_evolved.json
+uv run python scripts/quality_assessment.py --input data/seed_prompts.json --stats-only
 
-# Quality assessment for evolved data / seed pools
-uv run python scripts/assess_evolution.py data/evolved/generation_1.json  # For evolved generation data
-uv run python scripts/quality_assessment.py --input data/seed_prompts.json --stats-only  # For seed pool data
-uv run python scripts/quality_assessment.py --input data/seed_prompts.json --output data/filtered_seeds.json --min-quality 0.70
+# Use Volcano/Claude-compatible endpoint for evolution
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_evolution.py --use-claude --claude-model ark-code-latest --min-sleep 12 --max-sleep 18
 
-# Enable LLM quality discriminator during evolution (filters out low-quality prompts)
-uv run python scripts/run_evolution.py --discriminator-min-score 0.6  # Filter out prompts with score < 0.6
-uv run python scripts/run_evolution.py --disable-discriminator  # Skip quality filtering for speed (original behavior)
+# Repair math references with an LLM
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/fix_math_references_with_llm.py --input data/claude_evolved_4gen/final_evolved_v1.0_complete.json --sleep-min 10 --sleep-max 18
+
+# Generate trajectories in the real Environment
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/generate_single_trajectory_real_env.py --domain code_debug --max-steps 20 --sleep-min 10 --sleep-max 18
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/generate_all_trajectories_real_env.py --limit 3
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/generate_all_trajectories_real_env.py --domain code_debug --limit 5
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/generate_all_trajectories_real_env.py --resume data/sft_trajectories/batch_progress_YYYYMMDD_HHMMSS.jsonl
+
+# Best-of-N trajectory sampling and benchmarking
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/trajectory_sample.py --domain code_debug --limit 1 --n 4
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/trajectory_sample.py --benchmark --benchmark-tasks 100 --n 16 --task-concurrency 1
 ```
 
-### Manual Verification Commands
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Test chat completion
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"Qwen/Qwen2.5-7B-Instruct-AWQ",
-    "messages":[{"role":"user","content":"Hello!"}]
-  }'
-
-# Check NVIDIA driver
-nvidia-smi
-
-# Verify Docker GPU access
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
-```
+`run_evolution.py --use-mock` is the fastest smoke test because it exercises pipeline logic without real LLM calls. Scripts in `scripts/archive/` are historical data-prep utilities rather than current entry points.
 
 ## Architecture
 
-### Core Component Structure
-```
-src/
-├── agent_sft/
-│   ├── task_generator/      # IMPLEMENTED — seed pool + LLM-based task generation
-│   │   ├── models.py        # Pydantic data models
-│   │   ├── seed_pool.py     # Weighted sampling, versioning, JSON I/O
-│   │   ├── generator.py     # Async batch generation with retries
-│   │   ├── validator.py     # Task validation pipeline
-│   │   └── function_parser.py  # AST-based function validation
-│   ├── evol_instruct/       # IMPLEMENTED — multi-gen evolution pipeline
-│   │   ├── evolver.py       # 7 evolution strategies (deepening, widening, etc.)
-│   │   ├── models.py        # Evolution data models
-│   │   └── pipeline.py      # End-to-end: evolve → dedup → filter → stats
-│   ├── quality_filter/      # IMPLEMENTED — quality & diversity filtering
-│   │   ├── embedding_deduplicator.py  # Sentence-BERT similarity deduplication
-│   │   ├── lm_discriminator.py        # LLM-based quality judging
-│   │   └── metrics.py       # Self-BLEU, diversity statistics
-│   ├── function_registry.py # Available function library
-│   ├── trajectory_sampler/  # STUB
-│   └── dataset_builder/     # STUB
-└── infra/
-    ├── vllm_client/         # VLLMClient + Docker lifecycle (OpenAI-compatible)
-    ├── anthropic_client/    # Volcano Engine Claude endpoint (native protocol)
-    ├── local_transformers/  # Direct HuggingFace inference (dev/CPU)
-    ├── sandbox/             # IMPLEMENTED — Docker-isolated code execution
-    │   ├── execution_manager.py  # Container lifecycle + test execution
-    │   └── models.py        # Execution result data models
-    └── environment/         # IMPLEMENTED — RL Agent training environment
-        ├── environment.py   # Main env.step() interface
-        ├── sandbox_pool.py  # Docker container pool for concurrency
-        ├── answer_verifier.py  # 3-mode answer validation
-        └── models.py        # Action/Observation/StepResult Pydantic models
-```
+### `src/agent_sft`: data synthesis pipeline
 
-### LLM Client Interface
-All three clients (`VLLMClient`, `AnthropicClient`, `LocalLLMClient`) share a duck-typed interface: `chat()`, `achat()`, `achat_stream()`. `TaskGenerator` accepts any of them via dependency injection — it only calls `achat()`.
+- `task_generator/` defines seed/task Pydantic models, seed-pool sampling/versioning, LLM-based task generation, AST function-call parsing, and task validation.
+- `evol_instruct/` implements the multi-generation Evol-Instruct pipeline. `evolver.py` applies evolution strategies; `pipeline.py` orchestrates evolve → deduplicate → quality filter → stats.
+- `quality_filter/` contains embedding deduplication, LLM quality discrimination, and diversity metrics.
+- `trajectory_sampler/agent_loop.py` contains the teacher-agent harness: immutable `AgentState`, termination detection, trajectory recording, ReAct/function-JSON formatting, and layered Observation→Thought→Action generation.
+- `trajectory_sampler/trajectory_sample.py` implements best-of-N concurrent sampling, trajectory ranking, failure summaries, and sandbox failure detection.
+- `dataset_builder/` is currently only a package stub.
 
-### LLM Client Selection Guide
-| Client | Use Case | Pros | Cons |
-|--------|----------|------|------|
-| **VLLMClient** | Local GPU inference with vLLM Docker | Fast, no rate limits, OpenAI-compatible | Requires GPU ≥ 6GB VRAM (for AWQ 7B models) |
-| **AnthropicClient** | Volcano Claude API (China region) | High quality, thinking mode support | Rate limited, requires API token |
-| **LocalLLMClient** | Direct HuggingFace transformers | CPU/GPU compatible, no server needed | Slower, memory intensive |
+### `src/infra`: execution and model clients
 
-**AnthropicClient Special Features:**
-- `create_volcano_claude_client()` factory function for quick initialization
-- `sleep_before_request` / `sleep_after_request` parameters for rate limiting
-- `achat_stream()` async streaming support
-- Thinking mode extraction (handles `<thinking>` blocks in responses)
+- `vllm_client/` provides an OpenAI-compatible client used for local vLLM and the Volcano `coding/v3` endpoint in some scripts.
+- `anthropic_client/` contains a native-protocol Volcano Claude client.
+- `local_transformers/` supports direct HuggingFace inference for local development.
+- `sandbox/` provides Docker-isolated code execution and execution result models.
+- `environment/` implements the Gym-style agent environment: `Environment.step(action)` executes tool calls or verifies final answers, `SandboxPool` manages reusable Docker containers, and `AnswerVerifier` handles code, math, format, and judge-backed verification.
 
-### Task Generation Flow
-```
+### Core runtime flow
+
+```text
 SeedPromptPool
-      ↓ (weighted sampling by quality score)
-SeedPrompt[]
-      ↓
-TaskGenerator.generate_batch(mode="seed_based")
-      ↓
-┌─ Async Task Generation with Semaphore (5 concurrent) ─┐
-│   • LLM mutation via client.achat()                   │
-│   • Tenacity retry (3 attempts, exponential backoff)  │
-└────────────────────────────────────────────────────────┘
-      ↓
-TaskValidator.validate_batch()
-      ↓
-┌─ Validation Pipeline ─────────────────────────────────┐
-│   1. FunctionSignatureParser (AST validation)         │
-│   2. SandboxExecutor (code execution + test cases)    │
-└────────────────────────────────────────────────────────┘
-      ↓
-Task[] with ValidationReport
+  → TaskGenerator / EvolutionPipeline
+  → quality filters and discriminator
+  → enriched task JSON with test/reference data
+  → AgentLoop
+  → Environment.step(ToolCallAction | FinalAnswerAction)
+  → SandboxPool / AnswerVerifier
+  → TrajectoryRecorder
+  → raw trajectory JSON + SFT JSON
 ```
 
-Three generation modes: `seed_only` (pass-through), `seed_based` (optional LLM mutation), `full_generation`.
+LLM clients are duck-typed around `chat()`, `achat()`, and `achat_stream()` where available. Most pipeline code accepts an injected client rather than constructing one internally. Trajectory generation scripts wrap clients with explicit randomized sleep before each API/Judge call.
 
-### Evol-Instruct Pipeline Flow
-```
-Seed Prompts (N)
-      ↓
-┌─ Evolution Generation ────────────────────────────────────┐
-│  7 strategies: Deepen (constraints/reasoning/concretize), │
-│  Complex Input, CoT, Breadth, In-context Learning         │
-│  3 variants per seed → N×3 prompts                        │
-└────────────────────────────────────────────────────────────┘
-      ↓
-┌─ Embedding Deduplication ─────────────────────────────────┐
-│  Sentence-BERT embeddings + cosine similarity (0.85 thresh)│
-└────────────────────────────────────────────────────────────┘
-      ↓
-┌─ LLM Quality Discrimination ──────────────────────────────┐
-│  Judge: originality, clarity, complexity, value-add       │
-│  Minimum score: 0.5                                        │
-└────────────────────────────────────────────────────────────┘
-      ↓
-┌─ Diversity Metrics ───────────────────────────────────────┐
-│  Self-BLEU score, strategy distribution, filter rates     │
-└────────────────────────────────────────────────────────────┘
-      ↓
-Evolved Prompts (M) → seeds for next generation (4 gens total)
-```
+## Verification modes
 
-Output: `data/evolved/final_evolved.json` + per-generation statistics.
+`AnswerVerifier` and `Environment` use different validation paths by task domain/data shape:
 
-### Key Architectural Patterns
-- **Dependency Injection**: `TaskGenerator` accepts `llm_client`, `validators`, `task_validator` as parameters
-- **Duck Typing**: All LLM clients share the same interface - no abstract base class needed
-- **Async Semaphores**: Rate limiting for concurrent LLM calls
-- **Retry Pattern**: Tenacity with exponential backoff
-- **Strategy Pattern**: Domain-specific validators
+- `code_debug`: tries executable code validation against test cases; for debugging-report style expected outputs, combines format checks, LLM-as-judge, and evidence from prior successful `exec` tool calls.
+- `math_reasoning`: extracts final numeric/math answers and uses symbolic or numeric equivalence with tolerance.
+- `api_orchestration` and `multi_step_planning`: primarily use format validation plus optional LLM-as-judge for completeness and correctness.
 
-### Function Registry System
-The `FunctionRegistry` provides dynamic function resolution and validation:
-- **Categories**: `BUILTIN` (Python builtins), `STANDARD_LIBRARY` (stdlib modules), `CUSTOM` (user-defined)
-- Used by `FunctionSignatureParser` to AST-validate function calls in generated tasks
-- Supports category-based filtering during task generation
+## Data paths
 
-### Sandbox Execution
-The Docker-based sandbox provides isolated code execution:
-- **SandboxConfig**: `memory_limit`, `disk_limit`, `network_access`, `image`, `timeout`
-- **Lifecycle**: Async context manager creates/destroys containers automatically
-- **Validation**: Runs test cases against generated code and returns `TestCaseExecution` results
+- `data/raw/`: raw collected sources such as StackOverflow XML, parquet math data, OpenAPI/SDK examples, Ansible examples, and workflow examples.
+- `data/seed_prompts.json`: 200 seed prompts documented in `data/README.md`.
+- `data/final_seed_pool_181_real.json`: real curated seed-pool example used by newer pipeline commands.
+- `data/evolved/`: Evol-Instruct outputs.
+- `data/claude_evolved_4gen/final_evolved_v1.0_complete.json`: complete 4-generation task dataset with reference/test enrichment.
+- `data/reference_checks/`: math reference audit/fix outputs and checkpoints.
+- `data/sft_trajectories/`: raw and SFT-format trajectories, batch progress JSONL, best-of-N summaries, and benchmark reports generated by AgentLoop scripts.
 
-### RL Environment System
-Standard Gym-style `env.step()` interface for agent training:
-- **`Environment`** (`src/infra/environment/environment.py`): Unified action-observation loop
-  - `ToolCallAction`: `exec` (run code), `eval` (evaluate expression)
-  - `FinalAnswerAction`: Submit solution for verification
-  - `reset(task)` → initial observation
-  - `step(action)` → observation + `done` flag
-- **`SandboxPool`** (`src/infra/environment/sandbox_pool.py`): Docker container pool
-  - 30s timeout, 512MB memory limit enforced per container
-  - Async concurrent execution with semaphore control
-  - Container reuse + idle cleanup (configurable `idle_timeout`)
-- **`AnswerVerifier`** (`src/infra/environment/answer_verifier.py`): 3-mode validation
-  - `CODE_EXECUTION` - Run code against test cases in sandbox
-  - `MATH_EQUATION` - SymPy symbolic equivalence + numeric tolerance
-  - `FORMAT_VALIDATION` - Regex/required field checks for open tasks
-- **LLM-as-Judge** - Uses `lm_discriminator.py` pattern for planning/api tasks
+Evolved prompt files may not have exactly the same structure as seed prompts: they can include `evolution_metadata`, omit or inherit `source`, and have `validator_code = null`.
 
-**Key Data Flow**:
-```
-Agent → Environment.step(action) → Observation → Agent
-                           ↓
-                    AnswerVerifier (3 modes)
-                           ↓
-                    SandboxPool (Docker)
-```
+## Testing boundaries
 
-**Training Data**: `data/claude_evolved_4gen/final_evolved_v1.0_complete.json`
-- 2858 total prompts across 4 domains
-- 510 code_debug tasks with reference solutions
-- 351 code_debug tasks sandbox-verified (reference_solution + test_cases + validation passed)
+- `tests/validation/` is offline and should be the first target for quick checks.
+- `tests/infra/environment/test_environment.py` and sandbox validation paths require Docker.
+- `tests/test_trajectory_sample.py` covers best-of-N sampling utilities without requiring real API calls.
+- `tests/test_vllm_client.py` requires a vLLM/Docker setup.
+- `tests/test_volcano_claude*.py` require API credentials.
 
-### Rate Limiting Patterns
-For Claude API evolution runs:
-- Wrap `client.achat` with random sleep (12-18s by default) before each request
-- Set `max_concurrent_requests=1` for serialized execution
-- Use `discriminator_min_score` filtering to reduce unnecessary API calls
+## Development notes
 
-### Seed Pool API Quick Reference
-
-```python
-from src.agent_sft.task_generator.seed_pool import SeedPromptPool
-from src.agent_sft.task_generator.models import Domain, Difficulty
-
-pool = SeedPromptPool.load("data/seed_prompts.json")
-
-# Sample by domain/difficulty
-code_seeds = pool.sample(count=10, domain=Domain.CODE_DEBUG)
-hard_api_seeds = pool.sample(count=5, domain=Domain.API_ORCHESTRATION, difficulty=Difficulty.HARD)
-
-# Weighted sampling (higher quality seeds sampled more often)
-high_quality_seeds = pool.sample(count=20, weight_by_quality=True)
-
-# Avoid duplicate sampling across batches
-batch1 = pool.sample(count=10, avoid_duplicates=True)
-batch2 = pool.sample(count=10, avoid_duplicates=True)
-pool.reset_sampling()
-
-# Version management
-pool.bump_version("v1.1")
-print(pool.get_version_history())
-
-# Statistics
-stats = pool.get_stats()  # {total_prompts, by_domain, by_difficulty, avg_quality_score}
-```
-
-### Data Structure
-Seed prompts are stored in `data/seed_prompts.json` with 200 high-quality prompts across 4 domains:
-- `code_debug` (50) - Code debugging tasks
-- `api_orchestration` (50) - API orchestration tasks  
-- `math_reasoning` (50) - Math reasoning tasks
-- `multi_step_planning` (50) - Multi-step planning tasks
-
-Each seed includes test cases, validator code, difficulty (Easy/Medium/Hard), and quality score.
-
-**Evolved Data Format Note:**
-Evolved prompts (`data/evolved/generation_*.json`) have a slightly different structure:
-- `evolution_metadata` - Contains generation number, parent_id, strategy, evolution prompt
-- `source` field may be missing (inherited from parent)
-- `validator_code` may be `null` (inherited from parent)
-- Test cases are preserved but may not match the evolved prompt
-
-Use `quality_assessment.py` with evolved data for pipeline statistics, but note it expects full seed structure.
-
-**Final Evolved Dataset**:
-- `data/claude_evolved_4gen/final_evolved_v1.0_complete.json` - 2858 prompts across 4 domains with reference solutions for RL training:
-  - `code_debug`: 510 tasks (351 sandbox-validated)
-  - `math_reasoning`: 769 tasks (includes `final_answer` field)
-  - `api_orchestration`: 767 tasks
-  - `multi_step_planning`: 812 tasks
-
-## Environment Variables
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `ANTHROPIC_AUTH_TOKEN` | Volcano Engine Claude API auth key | - |
-| `VOLCANO_CLAUDE_BASE_URL` | Volcano Claude API endpoint | `https://ark.cn-beijing.volces.com/api/coding/v3` |
-| `HF_TOKEN` | HuggingFace token for private models | - |
-| `VLLM_BASE_URL` | vLLM server endpoint | `http://localhost:8000/v1` |
-| `VLLM_MODEL` | vLLM model name | `Qwen/Qwen2.5-7B-Instruct-AWQ` |
-| `VLLM_PORT` | vLLM server port | `8000` |
-| `VLLM_GPU_MEMORY` | GPU memory utilization | `0.85` |
-| `VLLM_MODE` | Docker mode: `pull`/`build`/`full` | `pull` |
-| `VLLM_IMAGE` | Docker image name | `ghcr.io/huhulengkongqi/rl-sft-vllm:v0.6.3-rlsft.1` |
-| `VLLM_QUANTIZATION` | Quantization mode | `awq` |
-| `VLLM_USE_DOCKER` | Use Docker for vLLM | `true` |
-| `OPENAI_API_KEY` | For external OpenAI API calls | - |
-| `API_TIMEOUT_MS` | API call timeout in milliseconds | - |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Disable non-essential traffic flag | - |
-| `ANTHROPIC_API_KEY` | For Anthropic API calls (not used by volcano client) | - |
-| `E2B_API_KEY` | For E2B sandbox (optional) | - |
-| `LOG_LEVEL` | Logging level | `INFO` |
-| `MAX_CONCURRENT_REQUESTS` | Max concurrent LLM requests | `5` |
-
-## Key Files Reference
-
-| File | Purpose |
-|------|---------|
-| **Task Generation** | |
-| `src/agent_sft/task_generator/generator.py` | Main task generation logic |
-| `src/agent_sft/task_generator/validator.py` | Task validation pipeline |
-| `src/agent_sft/task_generator/function_parser.py` | AST-based function call validation |
-| **Evol-Instruct** | |
-| `src/agent_sft/evol_instruct/pipeline.py` | End-to-end evolution pipeline |
-| `src/agent_sft/evol_instruct/evolver.py` | 7 evolution strategies engine |
-| **Quality Filtering** | |
-| `src/agent_sft/quality_filter/embedding_deduplicator.py` | Sentence-BERT deduplication |
-| `src/agent_sft/quality_filter/lm_discriminator.py` | LLM quality judge |
-| `scripts/quality_assessment.py` | Standalone seed quality assessment pipeline |
-| **Infrastructure** | |
-| `src/agent_sft/function_registry.py` | Available function library |
-| `src/infra/anthropic_client/client.py` | Volcano Claude native API client |
-| `src/infra/vllm_client/client.py` | vLLM OpenAI-compatible client |
-| `src/infra/sandbox/execution_manager.py` | Docker sandbox code execution |
-| **RL Environment** | |
-| `src/infra/environment/environment.py` | Main `env.step()` interface |
-| `src/infra/environment/sandbox_pool.py` | Docker container pool manager |
-| `src/infra/environment/answer_verifier.py` | 3-mode answer validator |
-| `src/infra/environment/models.py` | Action/Observation/StepResult Pydantic models |
-| `tests/infra/environment/test_environment.py` | 31 unit tests (10 code + 5 math end-to-end) |
-
-## Development Rules (Project-Specific)
-
-### Code Style
-- **Line length**: 120 characters
-- **Quote style**: Double quotes (`"`) preferred
-- **isort**: First-party packages `["agent_sft", "infra"]`
-- **Module docstrings**: All files have docstrings at the top
-- **Type hints**: Used throughout; mypy is used for type checking
-- **Logging**: Use `logger = logging.getLogger(__name__)` pattern
-
-### Data Models
-- Use Pydantic `BaseModel` for data models
-- Use `@dataclass` for config objects
-- Enums subclass `str, Enum` for type-safe string enums
-
-### Linting Rules (Ruff)
-Enabled categories: `E`, `W`, `F`, `I`, `N`, `UP`, `B`, `SIM`, `TCH`
-Specific ignores: `E501` (line too long), `B008` (allows mutable defaults)
-
-## Testing Structure
-
-```
-tests/
-├── validation/               # ✅ OFFLINE - Unit tests, no external dependencies
-│   ├── test_seed_pool.py     # SeedPromptPool weighted sampling, I/O, versioning
-│   ├── test_task_generator.py # TaskGenerator, validators, function parsing
-│   └── test_task_validation.py # TaskValidation pipeline
-├── infra/environment/
-│   └── test_environment.py   # 🐳 REQUIRES DOCKER - 31 RL env tests (10 code + 5 math E2E)
-├── test_vllm_client.py       # 🐳 REQUIRES DOCKER - vLLM Docker integration
-├── test_volcano_claude.py    # 🔑 REQUIRES API KEY - Volcano Claude endpoint
-├── test_volcano_claude_native.py
-├── test_unified_client.py
-└── test_local_llm.py         # ✅ OFFLINE - Local HuggingFace transformers
-```
-
-- **`MockLLMClient`** - Built into `run_evolution.py` for offline testing without real LLM calls
-- Use `--use-mock` flag with `run_evolution.py` to validate pipeline logic without API calls
-
-## Script Inventory
-
-| Script | Purpose | Requires |
-|--------|---------|----------|
-| `start_vllm_docker.sh` | Start vLLM Docker service (respects `VLLM_MODE`) | Docker + GPU |
-| `stop_vllm_docker.sh` | Stop vLLM containers | Docker |
-| `verify_vllm.sh` | 6-point validation suite (health, model load, inference) | Docker + vLLM running |
-| `pull_vllm_image.sh` | Pre-pull GHCR image for faster startup | Docker |
-| `run_evolution.py` | Evol-Instruct pipeline (4 gens, 3 variants/seed) | LLM API (or mock) |
-| `generate_seed_prompts.py` | Regenerate 200 seed prompts | LLM API |
-| `demo_task_generator.py` | Demo task generation pipeline | LLM API |
-| `demo_task_validation.py` | Demo sandbox code execution validation | Docker |
-| `quality_assessment.py` | Seed quality scoring + filtering pipeline | LLM API (optional) |
-| `assess_evolution.py` | Evolution statistics for generation data | None |
-
-## Reproducibility Guarantees
-1. **SHA256 Digest Locked Base Images** - All Docker base images pinned by digest
-2. **Hash-Locked Python Dependencies** - `requirements-vllm.txt` includes full SHA256 hashes
-3. **GHCR Provenance Attestation** - GitHub Actions auto-publish with build attestation
-4. **Deterministic Builds** - All pip installs use `--require-hashes`
-
-## Troubleshooting
-- **NVIDIA Driver Mismatch**: Ensure driver version ≥ 550.x for CUDA 12.4
-- **Docker GPU Passthrough**: Run `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` to verify
-- **vLLM Startup Failures**: Check `docker compose logs vllm` for OOM or model download issues
-- **Claude API Rate Limiting**: Increase `--min-sleep` and `--max-sleep` values, reduce concurrency to 1
-- **HF Mirror in China**: Set `HF_ENDPOINT=https://hf-mirror.com` for faster model downloads
+- Python source lives under `src/`; scripts explicitly add `src` to `sys.path` when run directly.
+- Data models use Pydantic `BaseModel`; config-style objects commonly use dataclasses; string enums subclass `str, Enum`.
+- Keep API-calling scripts rate-limited. Existing scripts use serialized or low-concurrency calls with random sleeps such as 10–18s or 12–18s.
+- Prefer `uv run ...` for commands so the project environment is used consistently.

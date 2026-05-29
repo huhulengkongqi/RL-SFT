@@ -275,15 +275,19 @@ class MathEquationVerifier(BaseVerifier):
                 diff = abs(answer_num - truth_num)
                 rounding_decimals = max(answer_decimals, truth_decimals)
                 rounded_equal = round(answer_num, rounding_decimals) == round(truth_num, rounding_decimals)
-                if diff <= self.tolerance or rounded_equal:
+                cent_tolerance = 0.01
+                cent_equal = diff <= cent_tolerance
+                if diff <= self.tolerance or rounded_equal or cent_equal:
+                    match_type = "numeric" if diff <= self.tolerance else "rounded_numeric" if rounded_equal else "cent_tolerance"
                     return VerificationResult(
                         mode=VerificationMode.MATH_EQUATION,
                         passed=True,
                         score=1.0,
                         details={
-                            "match_type": "numeric" if diff <= self.tolerance else "rounded_numeric",
+                            "match_type": match_type,
                             "difference": diff,
                             "tolerance": self.tolerance,
+                            "cent_tolerance": cent_tolerance,
                             "rounding_decimals": rounding_decimals,
                         },
                     )

@@ -29,7 +29,7 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from agent_sft.trajectory_sampler import AgentLoop, Trajectory
+from agent_sft.trajectory_sampler import AgentLoop, LayeredTemperatureConfig, Trajectory
 from infra.environment.environment import Environment
 from infra.vllm_client.client import VLLMClient
 
@@ -175,8 +175,11 @@ async def main() -> None:
     ])
     parser.add_argument("--model", default="doubao-seed-2.0-lite")
     parser.add_argument("--max-steps", type=int, default=6)
-    parser.add_argument("--sleep-min", type=float, default=3.0)
-    parser.add_argument("--sleep-max", type=float, default=8.0)
+    parser.add_argument("--sleep-min", type=float, default=10.0)
+    parser.add_argument("--sleep-max", type=float, default=18.0)
+    parser.add_argument("--thought-temperature", type=float, default=0.8)
+    parser.add_argument("--action-temperature", type=float, default=0.2)
+    parser.add_argument("--single-call", action="store_true", help="Disable Observation->Thought->Action two-call loop")
     parser.add_argument("--output-dir", default="data/sft_trajectories")
     args = parser.parse_args()
 
@@ -189,11 +192,14 @@ async def main() -> None:
     print("=" * 70)
     print("GENERATE SINGLE TRAJECTORY WITH REAL ENVIRONMENT")
     print("=" * 70)
-    print(f"API key: {api_key[:12]}...{api_key[-4:]}")
+    print("API key: ANTHROPIC_AUTH_TOKEN")
     print(f"Domain: {args.domain}")
     print(f"Model: {args.model}")
     print(f"Max steps: {args.max_steps}")
-    print(f"Sleep: {args.sleep_min}s - {args.sleep_max}s")
+    print(f"Sleep: {args.sleep_min}s - {args.sleep_max}s before every API call")
+    print(f"Observation->Thought->Action: {not args.single_call}")
+    print(f"Thought T: {args.thought_temperature}")
+    print(f"Action T: {args.action_temperature}")
     print()
 
     task = load_random_task(args.domain)
@@ -214,6 +220,11 @@ async def main() -> None:
             llm_client=llm,
             max_steps=args.max_steps,
             token_budget=20000,
+            temperature_config=LayeredTemperatureConfig(
+                enabled=not args.single_call,
+                thought_temperature=args.thought_temperature,
+                action_temperature=args.action_temperature,
+            ),
         )
         trajectory = await loop.run(task)
 

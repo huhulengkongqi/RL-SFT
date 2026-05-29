@@ -527,6 +527,51 @@ class TestAgentLoopIntegration:
         assert len(sft_data["messages"]) > 0
 
     @pytest.mark.asyncio
+    async def test_code_debug_requires_exec_before_final_answer(self):
+        """code_debug should reject direct final answer until a successful exec observation exists."""
+        llm = MockLLMClient([
+            "Final Answer:\nDirect answer without evidence",
+            "Tool: exec\nCode: print('validated')",
+            "Final Answer:\nNow with evidence",
+        ])
+        env = MockEnvironment(always_succeed=True)
+        loop = AgentLoop(env, llm, max_steps=5)
+
+        trajectory = await loop.run({
+            "id": "test-task-code-debug-guard",
+            "domain": "code_debug",
+            "difficulty": "easy",
+            "prompt": "Fix code with validation.",
+            "test_cases": [],
+        })
+
+        assert trajectory.termination_reason == "success"
+        assert trajectory.success is True
+        assert len(trajectory.steps) == 2
+        assert trajectory.steps[0].action.action_type == "tool_call"
+        assert trajectory.steps[0].action.name == "exec"
+        assert llm.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_final_answer_failed_is_not_success(self):
+        """Final answer with failed verification should terminate as failed, not success."""
+        llm = MockLLMClient(["Final Answer:\nwrong answer"])
+        env = MockEnvironment(always_succeed=False)
+        loop = AgentLoop(env, llm, max_steps=5)
+
+        trajectory = await loop.run({
+            "id": "test-task-final-failed",
+            "domain": "code_debug",
+            "difficulty": "easy",
+            "prompt": "Return the correct solution.",
+            "test_cases": [],
+        })
+
+        assert trajectory.termination_reason == "final_answer_failed"
+        assert trajectory.success is False
+        assert len(trajectory.steps) == 1
+
+    @pytest.mark.asyncio
     async def test_full_loop_max_steps(self):
         """Test loop terminates correctly at max_steps limit."""
         # Mock LLM that NEVER produces final answer (loops forever)

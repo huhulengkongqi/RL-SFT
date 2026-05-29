@@ -73,18 +73,27 @@ def normalize_numeric_answer(value: Any) -> Optional[str]:
         return num
 
 
-def update_reference(task: Dict[str, Any], corrected_answer: str) -> None:
-    """Update math reference in-place, preserving existing structure."""
-    corrected_answer = normalize_numeric_answer(corrected_answer) or str(corrected_answer)
-    task["final_answer"] = str(corrected_answer)
+def normalize_answer(value: Any) -> Any:
+    """Normalize scalar or structured math answers."""
+    if isinstance(value, dict):
+        return {str(k): normalize_answer(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [normalize_answer(v) for v in value]
+    return normalize_numeric_answer(value) or value
+
+
+def update_reference(task: Dict[str, Any], corrected_answer: Any) -> None:
+    """Update math reference in-place, preserving scalar or structured answer shape."""
+    corrected_answer = normalize_answer(corrected_answer)
+    task["final_answer"] = corrected_answer
     test_cases = task.get("test_cases") or []
     if test_cases:
         expected = test_cases[0].setdefault("expected_output", {})
         if isinstance(expected, dict):
-            expected["final_answer"] = str(corrected_answer)
-            expected["answer"] = str(corrected_answer)
+            expected["final_answer"] = corrected_answer
+            expected["answer"] = corrected_answer
         else:
-            test_cases[0]["expected_output"] = {"final_answer": str(corrected_answer), "answer": str(corrected_answer)}
+            test_cases[0]["expected_output"] = {"final_answer": corrected_answer, "answer": corrected_answer}
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:
@@ -110,11 +119,11 @@ You must independently solve the math problem and decide if the stored reference
 Important requirements:
 - Do NOT assume the stored reference is correct.
 - Independently solve the problem and extract the final answer.
-- The final answer MUST be a single numeric string whenever possible.
-- If the correct answer is an integer, output it as digits only, e.g. "42".
-- If the correct answer is not an integer, output a decimal, e.g. "15.4" or "0.154".
-- Do NOT include units, percent signs, commas, equations, explanations, or words in independent_answer/corrected_answer.
-- If the stored reference is wrong, provide the corrected final numeric answer.
+- If the task asks for ONE final value, use answer_type="scalar" and output a single numeric string.
+- If the task explicitly asks for MULTIPLE final values, use answer_type="structured" and output a JSON object with clear snake_case keys.
+- Numeric values must be strings containing only numbers and optional decimal point, e.g. "42", "15.4", "0.154".
+- Do NOT include units, percent signs, commas, equations, explanations, or words inside numeric values.
+- If the stored reference is wrong or incomplete, provide the corrected answer in the right scalar/structured shape.
 - If the task is ambiguous or impossible to verify, mark cannot_verify.
 - Output ONLY valid JSON.
 
@@ -129,10 +138,11 @@ Test cases / metadata:
 
 Return exactly this JSON schema:
 {{
+  "answer_type": "scalar or structured",
   "reference_correct": true or false,
   "confidence": 0.0 to 1.0,
-  "independent_answer": "single numeric answer only, no units or explanation",
-  "corrected_answer": "single numeric answer that should be stored; same as stored reference if correct",
+  "independent_answer": "single numeric string if scalar, or object if structured",
+  "corrected_answer": "answer that should be stored; same as stored reference if correct; string for scalar or object for structured",
   "stored_reference": "the stored reference you checked",
   "reason": "concise explanation",
   "error_type": "none | wrong_reference | ambiguous_task | insufficient_information | cannot_verify"
@@ -209,13 +219,13 @@ async def audit_one(llm: RateLimitedLLM, task: Dict[str, Any]) -> Dict[str, Any]
         )
         return result
 
-    parsed["independent_answer"] = normalize_numeric_answer(parsed.get("independent_answer")) or parsed.get("independent_answer")
-    parsed["corrected_answer"] = normalize_numeric_answer(parsed.get("corrected_answer")) or parsed.get("corrected_answer")
+    parsed["independent_answer"] = normalize_answer(parsed.get("independent_answer"))
+    parsed["corrected_answer"] = normalize_answer(parsed.get("corrected_answer"))
     result.update(parsed)
     corrected = result.get("corrected_answer") or result.get("independent_answer")
     should_update = result.get("reference_correct") is False and result.get("error_type") == "wrong_reference" and corrected
     result["updated"] = bool(should_update)
-    result["new_reference"] = str(corrected) if should_update else normalize_numeric_answer(reference) or reference
+    result["new_reference"] = corrected if should_update else normalize_answer(reference)
     return result
 
 

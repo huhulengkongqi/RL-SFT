@@ -9,13 +9,34 @@ Core components:
 
 import copy
 import hashlib
+import json
 import re
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from infra.environment.models import Action, FinalAnswerAction, Observation, StepResult, ToolCallAction
+
+
+class TrajectoryFormat(str, Enum):
+    """Supported trajectory serialization and action formats."""
+
+    REACT = "react"
+    FUNCTION_JSON = "function_json"
+
+
+@dataclass
+class LayeredTemperatureConfig:
+    """Observation -> Thought -> Action generation settings."""
+
+    enabled: bool = True
+    thought_temperature: float = 0.8
+    action_temperature: float = 0.2
+    thought_max_tokens: int = 2048
+    action_max_tokens: int = 4096
 
 
 class AgentState(BaseModel):
@@ -114,7 +135,7 @@ class AgentState(BaseModel):
         is_done = step_result.done or self.done
         term_reason = self.termination_reason
         if is_done and not term_reason and isinstance(action, FinalAnswerAction):
-            term_reason = "success"
+            term_reason = "success" if observation.success else "final_answer_failed"
 
         return AgentState(
             # Task metadata (unchanged)
@@ -220,15 +241,16 @@ class TerminationDetector:
                     details={"error": error, "step": state.step},
                 )
 
-        # Priority 2: Success (final answer submitted)
-        if state.done and state.termination_reason == "success":
+        # Priority 2: Final answer submitted
+        if state.done and state.termination_reason in {"success", "final_answer_failed"}:
             return TerminationDecision(
                 should_terminate=True,
-                reason="success",
+                reason=state.termination_reason,
                 details={
                     "steps": state.step,
                     "test_cases_passed": state.test_cases_passed,
                     "test_cases_total": state.test_cases_total,
+                    "error": state.last_observation.error if state.last_observation else None,
                 },
                 score=state.final_score,
             )
@@ -278,6 +300,7 @@ class TrajectoryStep(BaseModel):
 
     step: int = Field(..., description="Step number")
     state_snapshot: Dict[str, Any] = Field(..., description="Deep copied state snapshot")
+    thought: Optional[str] = Field(None, description="High-temperature thought generated before action")
     action: Action = Field(..., description="Action taken")
     observation: Observation = Field(..., description="Observation received")
     token_usage: Optional[Dict[str, int]] = Field(None, description="Token usage for this step")
@@ -298,36 +321,52 @@ class Trajectory(BaseModel):
     total_time: float = Field(0.0, description="Total execution time in seconds")
     success: bool = Field(..., description="Whether task was solved successfully")
 
-    def to_sft_format(self) -> Dict[str, Any]:
-        """Convert trajectory to standard SFT training format.
-
-        Returns:
-            Dictionary with conversation-style SFT data
-        """
+    def to_sft_format(self, trajectory_format: str = TrajectoryFormat.REACT.value) -> Dict[str, Any]:
+        """Convert trajectory to standard SFT training format."""
         messages = []
 
-        # System message with task info
         messages.append({
             "role": "system",
             "content": f"You are an agent solving a {self.domain} task. Follow the tool protocol exactly.",
         })
 
-        # Initial task message
         first_snapshot = self.steps[0].state_snapshot if self.steps else {}
         task_prompt = first_snapshot.get("metadata", {}).get("task_prompt")
         if task_prompt:
             messages.append({"role": "user", "content": f"Task:\n{task_prompt}"})
 
-        # Conversation: assistant action -> user observation
         for step in self.steps:
             action = step.action
-            thought = action.thought or ""
-            if action.action_type == "tool_call":
+            thought = step.thought or action.thought or ""
+            if thought:
+                if trajectory_format == TrajectoryFormat.FUNCTION_JSON.value:
+                    thought_content = json.dumps({"type": "thought", "content": thought}, ensure_ascii=False)
+                else:
+                    thought_content = f"Thought: {thought}"
+                messages.append({"role": "assistant", "content": thought_content.strip()})
+
+            if trajectory_format == TrajectoryFormat.FUNCTION_JSON.value:
+                if action.action_type == "tool_call":
+                    action_content = json.dumps(
+                        {
+                            "type": "action",
+                            "action": "tool_call",
+                            "tool": action.name,
+                            "arguments": action.kwargs,
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    action_content = json.dumps(
+                        {"type": "action", "action": "final_answer", "answer": action.answer},
+                        ensure_ascii=False,
+                    )
+            elif action.action_type == "tool_call":
                 tool_input = action.kwargs.get("code") or action.kwargs.get("expr") or action.kwargs.get("input") or str(action.args)
-                content = f"{thought}\n\nTool: {action.name}\nInput: {tool_input}"
+                action_content = f"Action: {action.name}\nAction Input: {tool_input}"
             else:
-                content = f"{thought}\n\nFinal Answer:\n{action.answer}"
-            messages.append({"role": "assistant", "content": content.strip()})
+                action_content = f"Final Answer:\n{action.answer}"
+            messages.append({"role": "assistant", "content": action_content.strip()})
 
             obs = step.observation
             if obs.success:
@@ -340,6 +379,7 @@ class Trajectory(BaseModel):
             "task_id": self.task_id,
             "domain": self.domain,
             "difficulty": self.difficulty,
+            "trajectory_format": trajectory_format,
             "messages": messages,
             "termination_reason": self.termination_reason,
             "final_score": self.final_score,
@@ -364,6 +404,7 @@ class TrajectoryRecorder:
         action: Action,
         observation: Observation,
         token_usage: Optional[Dict[str, int]] = None,
+        thought: Optional[str] = None,
     ) -> None:
         """Record single step with deep copy snapshot.
 
@@ -380,6 +421,7 @@ class TrajectoryRecorder:
             step = TrajectoryStep(
                 step=state.step,
                 state_snapshot=state.snapshot(),
+                thought=thought,
                 action=copy.deepcopy(action),
                 observation=copy.deepcopy(observation),
                 token_usage=copy.deepcopy(token_usage) if token_usage else None,
@@ -424,34 +466,101 @@ class TrajectoryRecorder:
         self.start_time = datetime.now()
 
 
-def _parse_llm_response(response: str) -> Action:
-    """Parse LLM response text into typed Action with improved format handling.
+def _strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
 
-    Supports formats (priority order):
-    1. Tool call: "Tool: exec\nCode: ..." or "Tool: eval\nInput: ..."
-    2. Final answer: "Final Answer:\n..."
-    3. Fallback: Markdown detection (LLM ignored format) -> wrap appropriately
 
-    Args:
-        response: Raw LLM response text
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    candidate = _strip_json_fence(text)
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(candidate):
+        if char != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(candidate[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
-    Returns:
-        Parsed Action (ToolCallAction or FinalAnswerAction)
-    """
+
+def _parse_json_action(response: str) -> Optional[Action]:
+    obj = _extract_first_json_object(response)
+    if not obj:
+        return None
+
+    action_value = str(obj.get("action") or obj.get("type") or obj.get("action_type") or "").lower()
+    thought = obj.get("thought")
+    tool_name = obj.get("tool") or obj.get("name") or obj.get("tool_name")
+    arguments = obj.get("arguments") or obj.get("kwargs") or obj.get("args") or {}
+    if not isinstance(arguments, dict):
+        arguments = {"input": arguments}
+    if "input" in obj and "input" not in arguments:
+        arguments["input"] = obj["input"]
+
+    if tool_name or action_value in {"tool", "tool_call", "function", "function_call"}:
+        name = str(tool_name or action_value).lower()
+        if name in {"tool", "tool_call", "function", "function_call"}:
+            name = str(obj.get("function") or obj.get("function_name") or obj.get("name") or "exec").lower()
+        if name == "eval" and "expr" not in arguments:
+            arguments = {"expr": arguments.get("input") or arguments.get("code") or arguments}
+        elif name == "exec" and "code" not in arguments:
+            arguments = {"code": arguments.get("input") or arguments}
+        return ToolCallAction(action_type="tool_call", name=name, kwargs=arguments, thought=str(thought) if thought else None)
+
+    if action_value in {"final", "final_answer", "answer", "submit"} or "answer" in obj:
+        return FinalAnswerAction(
+            action_type="final_answer",
+            answer=obj.get("answer") or obj.get("final_answer") or obj.get("output") or "",
+            thought=str(thought) if thought else None,
+        )
+    return None
+
+
+def _normalize_tool_input(tool_name: str, code_content: str) -> str:
+    if tool_name == "eval":
+        first_line = next((line.strip() for line in code_content.splitlines() if line.strip()), "")
+        arithmetic = re.match(r"[\d\s+\-*/().,%]+", first_line)
+        return arithmetic.group(0).strip() if arithmetic and arithmetic.group(0).strip() else first_line
+    if tool_name == "exec":
+        fenced = re.findall(r"```(?:python)?\s*\n(.*?)```", code_content, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            return fenced[0].strip()
+        return code_content.replace("```python", "").replace("```", "").strip()
+    return code_content.strip()
+
+
+def _parse_llm_response(response: str, trajectory_format: str = TrajectoryFormat.REACT.value) -> Action:
+    """Parse LLM response text into typed Action with JSON, ReAct, and legacy support."""
     cleaned_response = re.sub(r"</think_never_used_[^>]+>", "", response)
     cleaned_response_stripped = cleaned_response.strip()
 
-    # 1. Check for tool call FIRST.
-    # If the LLM mixes Tool and Final Answer in one response, execute the first tool only.
-    # The model will see the real observation and can provide Final Answer on the next turn.
+    json_action = _parse_json_action(cleaned_response)
+    if json_action:
+        return json_action
 
-    # Check for tool call - supports both formats:
-    #    Format A: "Tool: eval\nInput: 1+1"
-    #    Format B: "Tool: eval Input: 1+1" (same line)
+    react_match = re.search(
+        r"(?:thought\s*:\s*(?P<thought>.*?))?\s*action\s*:\s*(?P<tool>\w+)\s*action\s*input\s*:\s*(?P<input>.*)",
+        cleaned_response,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if react_match:
+        tool_name = react_match.group("tool").lower().strip()
+        code_content = _normalize_tool_input(tool_name, react_match.group("input").strip())
+        return ToolCallAction(
+            action_type="tool_call",
+            name=tool_name,
+            kwargs={"expr" if tool_name == "eval" else "code": code_content},
+            thought=(react_match.group("thought") or "").strip() or None,
+        )
+
     tool_match = re.search(r"tool\s*:\s*(\w+)", cleaned_response, re.IGNORECASE)
     if tool_match:
         tool_name = tool_match.group(1).lower().strip()
-        # Try matching "Code:" or "Input:" after tool match
         after_tool = cleaned_response[tool_match.end() :]
         code_match = re.search(r"(?:code|input)\s*:\s*(.*)", after_tool, re.IGNORECASE | re.DOTALL)
         if code_match:
@@ -464,21 +573,10 @@ def _parse_llm_response(response: str) -> Action:
             code_content = code_raw[: next_marker.start()].strip() if next_marker else code_raw
             code_content = re.sub(r"</think_never_used_[^>]+>", "", code_content).strip()
         else:
-            code_content = after_tool.strip().split("\n")[0]
-            code_content = re.sub(r"</think_never_used_[^>]+>", "", code_content).strip()
+            code_content = re.sub(r"</think_never_used_[^>]+>", "", after_tool.strip().split("\n")[0]).strip()
 
-        if tool_name == "eval":
-            first_line = next((line.strip() for line in code_content.splitlines() if line.strip()), "")
-            arithmetic = re.match(r"[\d\s+\-*/().,%]+", first_line)
-            code_content = arithmetic.group(0).strip() if arithmetic and arithmetic.group(0).strip() else first_line
-        elif tool_name == "exec":
-            fenced = re.findall(r"```(?:python)?\s*\n(.*?)```", code_content, flags=re.IGNORECASE | re.DOTALL)
-            if fenced:
-                code_content = fenced[0].strip()
-            else:
-                code_content = code_content.replace("```python", "").replace("```", "").strip()
-        thought_end = tool_match.start()
-        thought = cleaned_response[:thought_end].strip()
+        code_content = _normalize_tool_input(tool_name, code_content)
+        thought = cleaned_response[: tool_match.start()].strip()
         return ToolCallAction(
             action_type="tool_call",
             name=tool_name,
@@ -486,57 +584,34 @@ def _parse_llm_response(response: str) -> Action:
             thought=thought if thought else None,
         )
 
-    # 2. Check for final answer only when no tool call is present
     final_answer_match = re.search(r"final\s*answer\s*:\s*(.*)", cleaned_response, re.IGNORECASE | re.DOTALL)
     if final_answer_match:
         answer_content = final_answer_match.group(1).strip()
-        thought_end = final_answer_match.start()
-        thought = cleaned_response[:thought_end].strip()
+        thought = cleaned_response[: final_answer_match.start()].strip()
+        thought = re.sub(r"^thought\s*:\s*", "", thought, flags=re.IGNORECASE).strip()
         return FinalAnswerAction(
             action_type="final_answer",
             answer=answer_content,
             thought=thought if thought else None,
         )
 
-    # 3. Check for markdown patterns - LLM ignored format instructions!
-    # Common patterns: "###", "1.", bullet points, etc.
     looks_like_answer_directly = (
         cleaned_response_stripped.startswith("###")
         or cleaned_response_stripped.startswith("#")
         or cleaned_response_stripped.startswith("1.")
         or cleaned_response_stripped.startswith("- ")
         or "###" in cleaned_response_stripped[:100]
-        or (len(cleaned_response_stripped) > 200 and "\n" in cleaned_response_stripped)  # Multi-line content = probably answer
+        or (len(cleaned_response_stripped) > 200 and "\n" in cleaned_response_stripped)
     )
 
     if looks_like_answer_directly:
-        # LLM output full answer directly without format marker
-        return FinalAnswerAction(
-            action_type="final_answer",
-            answer=cleaned_response_stripped,
-            thought=None,
-        )
+        return FinalAnswerAction(action_type="final_answer", answer=cleaned_response_stripped, thought=None)
 
-    # 4. Final fallback: arithmetic expression -> eval, short code-like content -> exec, long content -> final answer
     if re.fullmatch(r"[\d\s+\-*/().,%]+", cleaned_response_stripped) and len(cleaned_response_stripped) < 150:
-        return ToolCallAction(
-            action_type="tool_call",
-            name="eval",
-            kwargs={"expr": cleaned_response_stripped},
-            thought=None,
-        )
+        return ToolCallAction(action_type="tool_call", name="eval", kwargs={"expr": cleaned_response_stripped}, thought=None)
     if len(cleaned_response_stripped) < 150:
-        return ToolCallAction(
-            action_type="tool_call",
-            name="exec",
-            kwargs={"code": cleaned_response_stripped},
-            thought=None,
-        )
-    return FinalAnswerAction(
-        action_type="final_answer",
-        answer=cleaned_response_stripped,
-        thought=None,
-    )
+        return ToolCallAction(action_type="tool_call", name="exec", kwargs={"code": cleaned_response_stripped}, thought=None)
+    return FinalAnswerAction(action_type="final_answer", answer=cleaned_response_stripped, thought=None)
 
 
 def _build_conversation_prompt(state: AgentState, task_prompt: str) -> List[Dict[str, str]]:
@@ -697,15 +772,33 @@ class AgentLoop:
         token_budget: int = 100000,
         loop_detection_threshold: int = 3,
         save_failed_steps: bool = True,
+        trajectory_format: str = TrajectoryFormat.REACT.value,
+        temperature_config: Optional[LayeredTemperatureConfig] = None,
     ):
         self.env = env
         self.llm_client = llm_client
         self.max_steps = max_steps
         self.token_budget = token_budget
+        self.trajectory_format = trajectory_format
+        self.temperature_config = temperature_config or LayeredTemperatureConfig(enabled=False)
 
         # Core components
         self.termination_detector = TerminationDetector(loop_detection_threshold)
         self.recorder = TrajectoryRecorder(save_failed_steps)
+
+    @staticmethod
+    def _has_successful_exec_observation(state: AgentState) -> bool:
+        for action, observation in zip(state.action_history, state.observation_history):
+            if isinstance(action, ToolCallAction) and action.name == "exec" and observation.success:
+                return True
+        return False
+
+    def _needs_code_debug_exec_before_final(self, state: AgentState, action: Action) -> bool:
+        return (
+            state.domain == "code_debug"
+            and isinstance(action, FinalAnswerAction)
+            and not self._has_successful_exec_observation(state)
+        )
 
     async def run(
         self,
@@ -776,11 +869,8 @@ class AgentLoop:
             # 1. Build conversation prompt
             messages = _build_conversation_prompt(state, task_prompt)
 
-            # 2. Generate action via LLM
-            llm_response, token_usage = await self._call_llm(messages)
-
-            # 3. Parse LLM cleaned_response into action
-            action = _parse_llm_response(llm_response)
+            # 2. Generate Thought then Action via LLM
+            action, token_usage, thought = await self._generate_valid_action(state, messages)
 
             # 4. Execute action in environment
             step_result = await self.env.step(action)
@@ -793,7 +883,7 @@ class AgentLoop:
             termination = self.termination_detector.check(state)
 
             # 7. Record step
-            self.recorder.record_step(state, action, observation, token_usage)
+            self.recorder.record_step(state, action, observation, token_usage, thought=thought)
 
             # Update done flag in state if terminating
             if termination.should_terminate and not state.done:
@@ -828,32 +918,185 @@ class AgentLoop:
             termination_details=termination.details,
         )
 
-    async def _call_llm(self, messages: List[Dict[str, str]]) -> Tuple[str, Optional[Dict[str, int]]]:
-        """Call LLM client with graceful fallback.
+    async def _generate_valid_action(
+        self,
+        state: AgentState,
+        messages: List[Dict[str, str]],
+    ) -> Tuple[Action, Optional[Dict[str, int]], Optional[str]]:
+        force_tool = state.domain == "code_debug" and not self._has_successful_exec_observation(state)
+        rejection: Optional[str] = None
+        total_usage: Optional[Dict[str, int]] = None
+        for _ in range(3):
+            thought: Optional[str] = None
+            if self.temperature_config.enabled:
+                llm_response, token_usage, thought = await self._generate_thought_and_action(
+                    messages,
+                    force_tool=force_tool,
+                    rejection=rejection,
+                )
+            else:
+                retry_messages = messages
+                if force_tool or rejection:
+                    retry_messages = [
+                        *messages,
+                        {"role": "user", "content": self._code_debug_exec_required_instruction(rejection)},
+                    ]
+                llm_response, token_usage = await self._call_llm(retry_messages, temperature=0.2 if force_tool else None)
+            total_usage = self._add_token_usage(total_usage, token_usage)
+            action = _parse_llm_response(llm_response, trajectory_format=self.trajectory_format)
+            if not self._needs_code_debug_exec_before_final(state, action):
+                return action, total_usage, thought
+            rejection = "Rejected Final Answer because code_debug requires a successful Tool: exec observation before final submission."
+        return action, total_usage, thought
 
-        Supports both:
-        - VLLMClient.achat() -> returns str
-        - AnthropicClient.chat() -> returns str or tuple
+    @staticmethod
+    def _code_debug_exec_required_instruction(rejection: Optional[str] = None) -> str:
+        prefix = f"{rejection}\n" if rejection else ""
+        return (
+            prefix
+            + "For code_debug, you must first run Tool: exec to reproduce or validate code before Final Answer. "
+            "Do NOT output Final Answer now. Output exactly one Tool: exec action with runnable Python code."
+        )
 
-        Args:
-            messages: Conversation messages
+    async def _generate_thought_and_action(
+        self,
+        messages: List[Dict[str, str]],
+        force_tool: bool = False,
+        rejection: Optional[str] = None,
+    ) -> Tuple[str, Optional[Dict[str, int]], str]:
+        """Generate Thought (high T) then Action (low T) in two separate LLM calls."""
+        thought, thought_usage = await self._generate_thought(messages)
+        action_response, action_usage = await self._generate_action(messages, thought, force_tool=force_tool, rejection=rejection)
+        return action_response, self._merge_token_usage(thought_usage, action_usage), thought
 
-        Returns:
-            Tuple of (response text, token usage dict)
-        """
+    async def _generate_thought(self, messages: List[Dict[str, str]]) -> Tuple[str, Optional[Dict[str, int]]]:
+        """Generate a Thought: high-temperature reasoning about the next step."""
+        config = self.temperature_config
+        thought_prompt = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "First, think step-by-step about what to do next. "
+                    "Analyze the current observation, consider alternatives, and decide on the best next step. "
+                    "Do NOT output any tool call or final answer yet — only your reasoning."
+                ),
+            },
+        ]
+        return await self._call_llm(
+            thought_prompt,
+            temperature=config.thought_temperature,
+            max_tokens=config.thought_max_tokens,
+        )
+
+    async def _generate_action(
+        self,
+        messages: List[Dict[str, str]],
+        thought: str,
+        force_tool: bool = False,
+        rejection: Optional[str] = None,
+    ) -> Tuple[str, Optional[Dict[str, int]]]:
+        """Generate an Action: low-temperature formatting of the decided action."""
+        config = self.temperature_config
+        guard = self._code_debug_exec_required_instruction(rejection) + "\n" if force_tool else ""
+        if self.trajectory_format == TrajectoryFormat.FUNCTION_JSON.value:
+            if force_tool:
+                format_instruction = (
+                    guard
+                    + "Based on the reasoning above, output exactly ONE JSON tool call and nothing else.\n"
+                    "Required format: {\"thought\":\"...\",\"action\":\"tool_call\",\"tool\":\"exec\",\"arguments\":{\"code\":\"...\"}}"
+                )
+            else:
+                format_instruction = (
+                    "Based on the reasoning above, output exactly ONE action as a JSON object and nothing else.\n"
+                    "Tool call: {\"thought\":\"...\",\"action\":\"tool_call\",\"tool\":\"exec|eval|check_solution\",\"arguments\":{...}}\n"
+                    "Final answer: {\"thought\":\"...\",\"action\":\"final_answer\",\"answer\":\"...\"}. "
+                    "Only choose final_answer when you can provide the COMPLETE required deliverable. Do not truncate. "
+                    "For code_debug final answers include root cause, complete corrected code in fenced python blocks, verification result, and pitfalls/requirements requested by the task."
+                )
+        else:
+            if force_tool:
+                format_instruction = (
+                    guard
+                    + "Based on the reasoning above, output exactly ONE tool action.\n"
+                    "Required format: Thought: ...\nAction: exec\nAction Input: <runnable Python code>"
+                )
+            else:
+                format_instruction = (
+                    "Based on the reasoning above, output exactly ONE action.\n"
+                    "Tool call: Thought: ...\nAction: exec|eval|check_solution\nAction Input: ...\n"
+                    "Final answer: Thought: ...\nFinal Answer:\n...\n"
+                    "Only choose Final Answer when you can provide the COMPLETE required deliverable. Do not truncate. "
+                    "For code_debug final answers include root cause, complete corrected code in fenced python blocks, verification result, and pitfalls/requirements requested by the task."
+                )
+        action_messages = [
+            *messages,
+            {"role": "assistant", "content": f"Thought: {thought}"},
+            {"role": "user", "content": format_instruction},
+        ]
+        return await self._call_llm(
+            action_messages,
+            temperature=config.action_temperature,
+            max_tokens=config.action_max_tokens,
+        )
+
+    @staticmethod
+    def _add_token_usage(
+        left: Optional[Dict[str, int]],
+        right: Optional[Dict[str, int]],
+    ) -> Optional[Dict[str, int]]:
+        if not left:
+            return copy.deepcopy(right) if right else None
+        if not right:
+            return copy.deepcopy(left)
+        merged = copy.deepcopy(left)
+        for key, value in right.items():
+            if isinstance(value, int):
+                merged[key] = merged.get(key, 0) + value
+        return merged
+
+    @staticmethod
+    def _merge_token_usage(
+        thought_usage: Optional[Dict[str, int]],
+        action_usage: Optional[Dict[str, int]],
+    ) -> Optional[Dict[str, int]]:
+        if not thought_usage and not action_usage:
+            return None
+        merged: Dict[str, int] = {}
+        for prefix, usage in (("thought", thought_usage), ("action", action_usage)):
+            if not usage:
+                continue
+            for key, value in usage.items():
+                if isinstance(value, int):
+                    merged[f"{prefix}_{key}"] = value
+                    if key == "total_tokens":
+                        merged["total_tokens"] = merged.get("total_tokens", 0) + value
+        return merged
+
+    async def _call_llm(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, Optional[Dict[str, int]]]:
+        """Call LLM client with graceful fallback."""
         try:
-            # Try async method first (achat), fallback to sync chat
+            call_kwargs = dict(kwargs)
+            if temperature is not None:
+                call_kwargs["temperature"] = temperature
+            if max_tokens is not None:
+                call_kwargs["max_tokens"] = max_tokens
+
             if hasattr(self.llm_client, "achat"):
-                # VLLMClient style - returns str only
                 response = await self.llm_client.achat(
                     model=getattr(self.llm_client, "model", "default"),
                     messages=messages,
+                    **call_kwargs,
                 )
             else:
-                # Other clients
-                response = await self.llm_client.chat(messages=messages)
+                response = await self.llm_client.chat(messages=messages, **call_kwargs)
 
-            # Handle different response formats
             if isinstance(response, tuple):
                 return response[0], response[1] if len(response) > 1 else None
             if hasattr(response, "content"):
@@ -861,7 +1104,7 @@ class AgentLoop:
                 usage = getattr(response, "usage", None)
                 return content, usage.model_dump() if usage else None
             if isinstance(response, str):
-                return response, {"total_tokens": len(response) // 4}  # Rough estimate
+                return response, {"total_tokens": len(response) // 4}
 
             return str(response), None
 

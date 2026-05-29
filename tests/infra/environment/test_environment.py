@@ -20,6 +20,35 @@ from infra.environment import (
 # Test Tasks: 10 code tasks + 5 math tasks
 # ============================================
 
+
+def test_extract_python_code_ignores_explanatory_text() -> None:
+    answer = """根因分析：这里是中文说明，不应该进入 /tmp/execute.py。
+
+```python
+def solution(x):
+    return x + 1
+```
+
+验证说明：这段也不是代码。
+"""
+
+    assert Environment._extract_python_code(answer) == "def solution(x):\n    return x + 1"
+
+
+def test_extract_python_code_prefers_parseable_fenced_block() -> None:
+    answer = """```text
+这不是 Python 代码
+```
+
+```python
+def solution():
+    return 42
+```
+"""
+
+    assert Environment._extract_python_code(answer) == "def solution():\n    return 42"
+
+
 CODE_TASKS: List[Dict[str, Any]] = [
     # Task 1: Basic arithmetic function
     {

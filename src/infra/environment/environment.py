@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+import textwrap
 from typing import Any, Dict, Optional
 
 from .answer_verifier import AnswerVerifier
@@ -59,14 +60,43 @@ class Environment:
         self._test_cases_total = 0
 
     @staticmethod
-    def _extract_python_code(answer: Any) -> Any:
+    def _is_parseable_python(code: str) -> bool:
+        try:
+            ast.parse(code)
+            return True
+        except SyntaxError:
+            return False
+
+    @classmethod
+    def _extract_python_code(cls, answer: Any) -> Any:
         """Extract executable Python code from a final answer if it contains fenced code blocks."""
         if not isinstance(answer, str):
             return answer
-        matches = re.findall(r"```(?:python)?\s*\n(.*?)```", answer, flags=re.IGNORECASE | re.DOTALL)
-        if matches:
-            return "\n\n".join(block.strip() for block in matches if block.strip())
-        return answer
+        fenced = re.findall(r"```([^\n`]*)\n(.*?)```", answer, flags=re.IGNORECASE | re.DOTALL)
+        cleaned_blocks = [
+            textwrap.dedent(block).strip()
+            for language, block in fenced
+            if block.strip() and language.strip().lower() in {"", "python", "py"}
+        ]
+        parseable_blocks = [block for block in cleaned_blocks if cls._is_parseable_python(block)]
+        if parseable_blocks:
+            return "\n\n".join(parseable_blocks)
+        if cleaned_blocks:
+            return cleaned_blocks[0]
+
+        stripped = textwrap.dedent(answer).strip()
+        code_indicators = (
+            "def ",
+            "class ",
+            "import ",
+            "from ",
+            "return ",
+            "if __name__",
+            "= ",
+        )
+        if any(indicator in stripped for indicator in code_indicators) and cls._is_parseable_python(stripped):
+            return stripped
+        return ""
 
     @staticmethod
     def _extract_math_answer(answer: Any) -> Any:
