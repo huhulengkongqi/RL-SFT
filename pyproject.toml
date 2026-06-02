@@ -24,6 +24,10 @@ sandbox = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+dataset = [
+    "datasets>=3.0.0",
+    "pyarrow>=15.0.0",
+]
 
 
 [build-system]
