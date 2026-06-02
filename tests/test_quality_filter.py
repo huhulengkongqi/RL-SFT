@@ -4,9 +4,18 @@ from pathlib import Path
 import pytest
 
 from agent_sft.quality_filter.quality_filter import (
+    DifficultyAwareSampler,
+    DifficultyClassifier,
     DeduplicatorMinhash,
     DedupTextConfig,
     DiversityMonitor,
+    FailureDetector,
+    HERRelabeler,
+    LLMJudgeConsensus,
+    LLMMCEstimator,
+    OfflineMCEstimator,
+    OutcomeExtractor,
+    ProcessRewardScorer,
     QualityFilter,
     QualityFilterConfig,
     ResultVerifier,
@@ -258,6 +267,174 @@ def test_embedding_dedup_enabled_smoke():
     assert [record.id for record in kept] == ["second"]
 
 
+def test_offline_mc_estimator_scores_steps_from_observations():
+    raw = make_raw()
+    raw["steps"].insert(
+        0,
+        {
+            "action": {"action_type": "tool_call", "name": "eval"},
+            "observation": {"success": False, "error": "bad call", "metadata": {}},
+        },
+    )
+    record = make_record(raw=raw, sft={})
+    scores, metadata = OfflineMCEstimator().estimate(record, None)
+
+    assert len(scores) == 2
+    assert scores[0].mc_score < scores[1].mc_score
+    assert metadata["step_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_llm_mc_estimator_scores_steps_with_fake_llm():
+    async def fake_mc(_record, _step_index, rollout_index):
+        return "correct" if rollout_index < 2 else "wrong"
+
+    raw = make_raw()
+    raw["steps"].insert(0, {"action": {"action_type": "tool_call"}, "observation": {"success": True, "content": "x"}})
+    record = make_record(raw=raw, sft={})
+
+    scores, metadata = await LLMMCEstimator(
+        fake_mc,
+        verifier=ResultVerifier(answer_verifier=FakeAnswerVerifier()),
+        rollouts=3,
+    ).estimate_async(
+        record,
+        None,
+        {"id": "task-1", "domain": "math_reasoning", "test_cases": [{"expected_output": "4"}]},
+    )
+
+    assert metadata["replay_mc_enabled"] is True
+    assert [score.mc_score for score in scores] == pytest.approx([1.0, 1.0])
+
+
+@pytest.mark.asyncio
+async def test_process_reward_scorer_fake_judge_consensus():
+    async def fake_judge(_record):
+        return '{"passed": true, "score": 0.8}'
+
+    record = make_record()
+    scorer = ProcessRewardScorer(
+        judge_consensus=LLMJudgeConsensus(judge_client=fake_judge, consensus_k=2),
+        min_score=0.5,
+    )
+    result = await scorer.score_record(record, None, None)
+
+    assert result.passed is True
+    assert result.judge_consensus["score"] == pytest.approx(0.8)
+    assert result.step_scores[0].judge_score == pytest.approx(0.8)
+
+
+@pytest.mark.asyncio
+async def test_process_reward_scorer_bad_judge_json_fail_closed():
+    async def bad_judge(_record):
+        return "not json"
+
+    record = make_record()
+    scorer = ProcessRewardScorer(
+        judge_consensus=LLMJudgeConsensus(judge_client=bad_judge, consensus_k=1, fail_closed=True),
+        min_score=0.5,
+    )
+    result = await scorer.score_record(record, None, None)
+
+    assert result.judge_consensus["passed"] is False
+    assert result.judge_consensus["errors"]
+
+
+def test_difficulty_classifier_assigns_pass32_buckets():
+    records = []
+    for task_id, successes in [("easy", 32), ("medium", 16), ("hard", 4), ("extreme", 0)]:
+        for i in range(32):
+            records.append(
+                make_record(
+                    raw=make_raw(task_id=task_id, success=i < successes),
+                    path=Path(f"{task_id}_{i}_raw.json"),
+                )
+            )
+
+    stats, summary = DifficultyClassifier().classify(records)
+
+    assert stats["easy"].bucket == "easy"
+    assert stats["medium"].bucket == "medium"
+    assert stats["hard"].bucket == "hard"
+    assert stats["extreme"].bucket == "extreme"
+    assert summary["bucket_counts_by_task"] == {"easy": 1, "medium": 1, "hard": 1, "extreme": 1}
+
+
+def test_difficulty_sampler_applies_ratio():
+    records = []
+    for bucket in ["easy", "medium", "hard", "extreme"]:
+        for i in range(5):
+            record = make_record(path=Path(f"{bucket}_{i}_raw.json"))
+            record.id = f"{bucket}_{i}"
+            record.difficulty = bucket
+            record.quality_score = 1.0 - i * 0.01
+            record.metadata["difficulty"] = {"bucket": bucket}
+            records.append(record)
+
+    selected, metadata = DifficultyAwareSampler(seed=0).sample(records, target_count=10)
+
+    assert len(selected) == 10
+    assert metadata["selected_by_bucket"] == {"hard": 4, "medium": 3, "extreme": 2, "easy": 1}
+
+
+@pytest.mark.asyncio
+async def test_llm_her_relabeler_rewrites_and_validates():
+    responses = iter(
+        [
+            json.dumps({"achievements": [{"description": "found partial result", "step_index": 0, "confidence": 0.9}]}),
+            json.dumps(
+                {
+                    "system_prompt": "HER system",
+                    "user_prompt": "Do the achieved subgoal",
+                    "final_answer": "found partial result",
+                }
+            ),
+            json.dumps({"valid": True, "score": 0.9, "reason": "supported"}),
+        ]
+    )
+
+    async def fake_llm(_system_prompt, _payload):
+        return next(responses)
+
+    raw = make_raw(success=False)
+    raw["steps"].insert(
+        0,
+        {"action": {"action_type": "tool_call"}, "observation": {"success": True, "content": "partial result"}},
+    )
+    record = make_record(raw=raw, sft={})
+    record.metadata["level1"] = {"passed": False, "error": "verification_failed"}
+
+    her_sft, report = await HERRelabeler(mode="hybrid", llm_client=fake_llm).relabel([record])
+
+    assert report["output_her_count"] == 1
+    assert her_sft[0]["messages"][0]["content"] == "HER system"
+    assert her_sft[0]["messages"][1]["content"] == "Do the achieved subgoal"
+    assert "found partial result" in her_sft[0]["messages"][2]["content"]
+    assert her_sft[0]["metadata"]["llm_validation"]["valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_her_relabeler_generates_rewritten_sft():
+    raw = make_raw(success=False)
+    raw["steps"].insert(
+        0,
+        {
+            "action": {"action_type": "tool_call", "name": "eval"},
+            "observation": {"success": True, "content": "partial result"},
+            "state_snapshot": {"metadata": {"task_prompt": "Solve all"}},
+        },
+    )
+    record = make_record(raw=raw, sft={})
+    record.metadata["level1"] = {"passed": False, "error": "verification_failed"}
+
+    her_sft, report = await HERRelabeler(mode="heuristic").relabel([record])
+
+    assert report["output_her_count"] == 1
+    assert her_sft[0]["metadata"]["her"] is True
+    assert "hindsight-relabelled" in her_sft[0]["messages"][0]["content"]
+    assert "partial result" in her_sft[0]["messages"][-1]["content"]
+
+
 @pytest.mark.asyncio
 async def test_quality_filter_report_has_four_stages(tmp_path):
     raw_path = tmp_path / "sample_raw.json"
@@ -289,5 +466,7 @@ async def test_quality_filter_report_has_four_stages(tmp_path):
     ]
     assert report["summary"]["input_count"] == 1
     assert report["summary"]["final_count"] == 1
-    assert report["funnel"][1]["skipped"] is True
-    assert report["funnel"][3]["skipped"] is True
+    assert report["funnel"][1]["implemented"] is True
+    assert report["funnel"][3]["implemented"] is True
+    assert "her_relabeling" in report
+    assert "difficulty_diagnostics" in report

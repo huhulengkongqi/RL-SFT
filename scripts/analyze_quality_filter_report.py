@@ -18,7 +18,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     report = json.loads(args.report.read_text(encoding="utf-8"))
+    level2 = next(stage for stage in report["funnel"] if stage["stage"] == "level2_prm_mc_llm_judge")
     level3 = next(stage for stage in report["funnel"] if stage["stage"] == "level3_deduplication_diversity")
+    level4 = next(stage for stage in report["funnel"] if stage["stage"] == "level4_difficulty_aware_sampling")
     metadata = level3["metadata"]
 
     print("Summary")
@@ -26,6 +28,26 @@ def main() -> None:
     print("\nFunnel")
     for stage in report["funnel"]:
         print(f"- {stage['stage']}: {stage['output_count']}/{stage['input_count']} ({stage['pass_rate']:.2%})")
+
+    print("\nLevel 2 PRM diagnostics")
+    for key in [
+        "mean_prm_score",
+        "min_prm_score",
+        "max_prm_score",
+        "filtered_below_threshold",
+        "per_step_score_count",
+        "judge_enabled",
+    ]:
+        print(f"- {key}: {level2['metadata'].get(key)}")
+
+    print("\nDifficulty diagnostics")
+    print(json.dumps(report.get("difficulty_diagnostics", {}), ensure_ascii=False, indent=2))
+
+    print("\nLevel 4 sampling diagnostics")
+    print(json.dumps(level4.get("metadata", {}), ensure_ascii=False, indent=2))
+
+    print("\nHER relabeling")
+    print(json.dumps(report.get("her_relabeling", {}), ensure_ascii=False, indent=2))
 
     print("\nEmbedding diagnostics")
     for key in [

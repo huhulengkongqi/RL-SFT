@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
+import random
 import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -120,6 +121,32 @@ class QualityFilterConfig:
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_diagnostics_top_k: int = 50
     diversity_sample_size: int = 500
+    enable_level2_prm: bool = True
+    level2_min_score: float = 0.5
+    level2_mc_weight: float = 0.6
+    level2_judge_weight: float = 0.4
+    level2_judge_consensus_k: int = 3
+    level2_fail_closed_on_judge_error: bool = False
+    level2_offline_mc_mode: str = "hybrid"
+    enable_level4_sampling: bool = True
+    difficulty_sampling_ratio: dict[str, int] = field(
+        default_factory=lambda: {"easy": 1, "medium": 3, "hard": 4, "extreme": 2}
+    )
+    difficulty_pass32_buckets: dict[str, tuple[float, float]] = field(
+        default_factory=lambda: {
+            "easy": (0.75, 1.01),
+            "medium": (0.35, 0.75),
+            "hard": (0.05, 0.35),
+            "extreme": (0.0, 0.05),
+        }
+    )
+    level4_target_count: int | None = None
+    level4_seed: int = 0
+    enable_her_relabeling: bool = True
+    her_include_in_filtered_sft: bool = False
+    her_mode: str = "hybrid"
+    her_max_per_failed_task: int = 2
+    her_min_partial_score: float = 0.2
     fail_open_missing_task: bool = False
 
     def __post_init__(self) -> None:
@@ -303,6 +330,704 @@ class ResultVerifier:
             if metadata.get("verification_score") is not None:
                 return float(metadata.get("verification_score") or 0.0)
         return 1.0 if record.raw.get("success") else 0.0
+
+
+@dataclass
+class TaskPassStats:
+    task_id: str
+    attempts: int
+    successes: int
+    pass32_rate: float
+    bucket: str
+    estimated_from_observed_n: bool
+
+
+@dataclass
+class StepPRMScore:
+    step_index: int
+    action_type: str | None
+    mc_score: float
+    judge_score: float | None
+    prm_score: float
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProcessRewardResult:
+    passed: bool
+    score: float
+    step_scores: list[StepPRMScore]
+    judge_consensus: dict[str, Any]
+    mc_metadata: dict[str, Any]
+
+
+class DifficultyClassifier:
+    def __init__(self, buckets: dict[str, tuple[float, float]] | None = None):
+        self.buckets = buckets or {
+            "easy": (0.75, 1.01),
+            "medium": (0.35, 0.75),
+            "hard": (0.05, 0.35),
+            "extreme": (0.0, 0.05),
+        }
+
+    def classify(self, records: list[TrajectoryRecord]) -> tuple[dict[str, TaskPassStats], dict[str, Any]]:
+        grouped: dict[str, list[TrajectoryRecord]] = defaultdict(list)
+        for record in records:
+            grouped[record.task_id].append(record)
+
+        stats: dict[str, TaskPassStats] = {}
+        for task_id, task_records in grouped.items():
+            attempts = min(32, len(task_records))
+            successes = sum(1 for record in task_records[:32] if self._is_success(record))
+            pass32_rate = successes / attempts if attempts else 0.0
+            bucket = self.bucket_for_rate(pass32_rate)
+            task_stats = TaskPassStats(
+                task_id=task_id,
+                attempts=attempts,
+                successes=successes,
+                pass32_rate=pass32_rate,
+                bucket=bucket,
+                estimated_from_observed_n=attempts < 32,
+            )
+            stats[task_id] = task_stats
+            for record in task_records:
+                record.difficulty = bucket
+                record.metadata["difficulty"] = asdict(task_stats)
+
+        return stats, self.summary(stats)
+
+    def bucket_for_rate(self, pass32_rate: float) -> str:
+        for bucket, (lower, upper) in self.buckets.items():
+            if lower <= pass32_rate < upper:
+                return bucket
+        return "medium"
+
+    @staticmethod
+    def _is_success(record: TrajectoryRecord) -> bool:
+        return bool(record.raw.get("success")) or float(record.raw.get("final_score") or 0.0) >= 1.0
+
+    def summary(self, stats: dict[str, TaskPassStats]) -> dict[str, Any]:
+        by_task = Counter(stat.bucket for stat in stats.values())
+        return {
+            "task_count": len(stats),
+            "bucket_counts_by_task": dict(by_task),
+            "insufficient_attempt_tasks": sum(1 for stat in stats.values() if stat.estimated_from_observed_n),
+            "bucket_thresholds": {bucket: list(bounds) for bucket, bounds in self.buckets.items()},
+        }
+
+
+class OfflineMCEstimator:
+    def estimate(
+        self,
+        record: TrajectoryRecord,
+        task_stats: TaskPassStats | None,
+    ) -> tuple[list[StepPRMScore], dict[str, Any]]:
+        terminal_score = self._terminal_score(record)
+        pass32_prior = task_stats.pass32_rate if task_stats else terminal_score
+        step_scores = []
+        for index, step in enumerate(record.raw.get("steps") or []):
+            observation = step.get("observation") or {}
+            immediate_score = self._observation_score(observation)
+            mc_score = clamp(0.55 * terminal_score + 0.25 * immediate_score + 0.20 * pass32_prior)
+            action = step.get("action") or {}
+            step_scores.append(
+                StepPRMScore(
+                    step_index=index,
+                    action_type=action.get("action_type"),
+                    mc_score=mc_score,
+                    judge_score=None,
+                    prm_score=mc_score,
+                    evidence={
+                        "terminal_score": terminal_score,
+                        "immediate_step_score": immediate_score,
+                        "task_pass32_prior": pass32_prior,
+                        "observation_success": observation.get("success"),
+                        "observation_error": observation.get("error"),
+                    },
+                )
+            )
+        if not step_scores:
+            step_scores.append(
+                StepPRMScore(0, None, terminal_score, None, terminal_score, {"terminal_score": terminal_score})
+            )
+        return step_scores, {
+            "terminal_score": terminal_score,
+            "task_pass32_prior": pass32_prior,
+            "step_count": len(step_scores),
+        }
+
+    @staticmethod
+    def _terminal_score(record: TrajectoryRecord) -> float:
+        if record.metadata.get("level1", {}).get("passed"):
+            return float(record.metadata["level1"].get("score") or 1.0)
+        if record.raw.get("final_score") is not None:
+            return clamp(float(record.raw.get("final_score") or 0.0))
+        return 1.0 if record.raw.get("success") else 0.0
+
+    @staticmethod
+    def _observation_score(observation: dict[str, Any]) -> float:
+        metadata = observation.get("metadata") or {}
+        for key in ("verification_score", "score"):
+            if metadata.get(key) is not None:
+                return clamp(float(metadata.get(key) or 0.0))
+        if observation.get("error"):
+            return 0.0
+        return 1.0 if observation.get("success") else 0.25
+
+
+class ReplayMCEstimator(OfflineMCEstimator):
+    def __init__(
+        self,
+        llm_client: Any,
+        verifier: ResultVerifier | None = None,
+        rollouts: int = 3,
+        fail_closed: bool = False,
+    ):
+        self.llm_client = llm_client
+        self.verifier = verifier or ResultVerifier()
+        self.rollouts = rollouts
+        self.fail_closed = fail_closed
+
+    async def estimate_async(
+        self,
+        record: TrajectoryRecord,
+        task_stats: TaskPassStats | None,
+        task: dict[str, Any] | None = None,
+    ) -> tuple[list[StepPRMScore], dict[str, Any]]:
+        fallback_scores, fallback_metadata = super().estimate(record, task_stats)
+        step_scores = []
+        errors = []
+        for fallback in fallback_scores:
+            rollout_results = []
+            for rollout_index in range(self.rollouts):
+                try:
+                    answer = await self._sample_continuation(record, fallback.step_index, rollout_index)
+                    passed = await self._verify_continuation(record, task, answer)
+                    rollout_results.append({"answer": answer, "passed": passed})
+                except Exception as exc:
+                    errors.append({"step_index": fallback.step_index, "error": str(exc)})
+                    rollout_results.append({"answer": None, "passed": False})
+            successes = sum(1 for result in rollout_results if result["passed"])
+            score = successes / self.rollouts if self.rollouts else 0.0
+            if errors and self.fail_closed and not rollout_results:
+                score = 0.0
+            step_scores.append(
+                StepPRMScore(
+                    step_index=fallback.step_index,
+                    action_type=fallback.action_type,
+                    mc_score=score,
+                    judge_score=None,
+                    prm_score=score,
+                    evidence={
+                        **fallback.evidence,
+                        "replay_rollouts": rollout_results,
+                        "successes": successes,
+                        "rollouts": self.rollouts,
+                    },
+                )
+            )
+        return step_scores, {
+            **fallback_metadata,
+            "mc_mode": "replay_rollout",
+            "replay_mc_enabled": True,
+            "replay_mc_rollouts": self.rollouts,
+            "replay_mc_errors": errors,
+        }
+
+    async def _sample_continuation(self, record: TrajectoryRecord, step_index: int, rollout_index: int) -> str:
+        prefix = record.raw.get("steps", [])[: step_index + 1]
+        prompt = {
+            "task_id": record.task_id,
+            "domain": record.domain,
+            "difficulty": record.difficulty,
+            "rollout_index": rollout_index,
+            "trajectory_prefix": prefix,
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Continue the agent trajectory from the provided prefix and produce only the final answer. "
+                    "Do not repeat the prefix. Output the final answer text directly."
+                ),
+            },
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ]
+        if hasattr(self.llm_client, "achat"):
+            return await self.llm_client.achat(
+                model=getattr(self.llm_client, "model", "default"),
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1024,
+            )
+        result = self.llm_client(record, step_index, rollout_index)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return str(result)
+
+    async def _verify_continuation(self, record: TrajectoryRecord, task: dict[str, Any] | None, answer: str) -> bool:
+        continuation = TrajectoryRecord(
+            id=f"{record.id}_replay",
+            task_id=record.task_id,
+            domain=record.domain,
+            difficulty=record.difficulty,
+            raw_path=record.raw_path,
+            sft_path=record.sft_path,
+            raw=record.raw,
+            sft=record.sft,
+            final_answer=answer,
+            dedup_text=record.dedup_text,
+        )
+        verified = await self.verifier.verify_record(continuation, task, fail_open_missing_task=False)
+        return bool(verified.metadata.get("level1", {}).get("passed"))
+
+
+LLMMCEstimator = ReplayMCEstimator
+
+
+class LLMJudgeConsensus:
+    def __init__(self, judge_client: Any | None = None, consensus_k: int = 3, fail_closed: bool = False):
+        self.judge_client = judge_client
+        self.consensus_k = consensus_k
+        self.fail_closed = fail_closed
+
+    async def judge(self, record: TrajectoryRecord) -> dict[str, Any]:
+        if self.judge_client is None:
+            return {"enabled": False, "skipped": True, "reason": "no_judge_client", "score": None, "passed": True}
+
+        votes = []
+        errors = []
+        for _ in range(self.consensus_k):
+            try:
+                raw = await self._call_judge(record)
+                parsed = parse_judge_json(raw)
+                score = clamp(float(parsed.get("score", 0.0)))
+                votes.append({"passed": bool(parsed.get("passed", False)), "score": score, "raw": parsed})
+            except Exception as exc:
+                errors.append(str(exc))
+                if self.fail_closed:
+                    votes.append({"passed": False, "score": 0.0, "raw": {"error": str(exc)}})
+
+        if not votes:
+            return {"enabled": True, "skipped": False, "score": None, "passed": not self.fail_closed, "errors": errors}
+
+        mean_score = sum(vote["score"] for vote in votes) / len(votes)
+        passed_votes = sum(1 for vote in votes if vote["passed"])
+        return {
+            "enabled": True,
+            "skipped": False,
+            "score": mean_score,
+            "passed": passed_votes > len(votes) / 2 and mean_score >= 0.5,
+            "passed_votes": passed_votes,
+            "failed_votes": len(votes) - passed_votes,
+            "errors": errors,
+            "votes": votes,
+        }
+
+    async def _call_judge(self, record: TrajectoryRecord) -> str:
+        prompt = {
+            "task_id": record.task_id,
+            "domain": record.domain,
+            "final_answer": record.final_answer,
+            "dedup_text_preview": record.dedup_text[:2000],
+        }
+        if hasattr(self.judge_client, "achat"):
+            return await self.judge_client.achat(
+                model=getattr(self.judge_client, "model", "default"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strict process-reward judge for agent trajectories. Evaluate whether the "
+                            "trajectory demonstrates a reliable path toward the correct answer. Return ONLY JSON "
+                            "with fields: passed (bool), score (0-1), reason (short string)."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+            )
+        result = self.judge_client(record)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return str(result)
+
+
+class ProcessRewardScorer:
+    def __init__(
+        self,
+        mc_estimator: OfflineMCEstimator | None = None,
+        judge_consensus: LLMJudgeConsensus | None = None,
+        min_score: float = 0.5,
+        mc_weight: float = 0.6,
+        judge_weight: float = 0.4,
+    ):
+        self.mc_estimator = mc_estimator or OfflineMCEstimator()
+        self.judge_consensus = judge_consensus or LLMJudgeConsensus()
+        self.min_score = min_score
+        self.mc_weight = mc_weight
+        self.judge_weight = judge_weight
+
+    async def score_record(
+        self,
+        record: TrajectoryRecord,
+        task: dict[str, Any] | None,
+        task_stats: TaskPassStats | None,
+    ) -> ProcessRewardResult:
+        if hasattr(self.mc_estimator, "estimate_async"):
+            step_scores, mc_metadata = await self.mc_estimator.estimate_async(record, task_stats, task)
+        else:
+            step_scores, mc_metadata = self.mc_estimator.estimate(record, task_stats)
+        mc_score = sum(step.prm_score for step in step_scores) / len(step_scores)
+        judge_consensus = await self.judge_consensus.judge(record)
+        judge_score = judge_consensus.get("score")
+        if judge_score is None:
+            score = mc_score
+            applied_weights = {"mc": 1.0, "judge": 0.0}
+        else:
+            score = self.mc_weight * mc_score + self.judge_weight * float(judge_score)
+            applied_weights = {"mc": self.mc_weight, "judge": self.judge_weight}
+            for step in step_scores:
+                step.judge_score = float(judge_score)
+                step.prm_score = self.mc_weight * step.mc_score + self.judge_weight * float(judge_score)
+        return ProcessRewardResult(
+            passed=score >= self.min_score and bool(judge_consensus.get("passed", True)),
+            score=clamp(score),
+            step_scores=step_scores,
+            judge_consensus={**judge_consensus, "applied_weights": applied_weights},
+            mc_metadata=mc_metadata,
+        )
+
+
+class DifficultyAwareSampler:
+    def __init__(self, ratio: dict[str, int] | None = None, seed: int = 0):
+        self.ratio = ratio or {"easy": 1, "medium": 3, "hard": 4, "extreme": 2}
+        self.seed = seed
+
+    def sample(
+        self,
+        records: list[TrajectoryRecord],
+        target_count: int | None = None,
+    ) -> tuple[list[TrajectoryRecord], dict[str, Any]]:
+        if not records:
+            return [], {"target_count": 0, "available_by_bucket": {}, "selected_by_bucket": {}}
+        target_count = min(target_count or len(records), len(records))
+        grouped: dict[str, list[TrajectoryRecord]] = defaultdict(list)
+        for record in records:
+            bucket = record.metadata.get("difficulty", {}).get("bucket", record.difficulty or "medium")
+            grouped[bucket].append(record)
+
+        available_by_bucket = {bucket: len(grouped.get(bucket, [])) for bucket in self.ratio}
+        quotas = self._quotas(target_count)
+        selected: list[TrajectoryRecord] = []
+        deficit = 0
+        selected_by_bucket: dict[str, int] = {}
+
+        for bucket, quota in quotas.items():
+            bucket_records = self._rank(grouped.get(bucket, []))
+            chosen = bucket_records[:quota]
+            selected.extend(chosen)
+            selected_by_bucket[bucket] = len(chosen)
+            deficit += max(0, quota - len(chosen))
+
+        if deficit:
+            already = {record.id for record in selected}
+            leftovers = [record for record in self._rank(records) if record.id not in already]
+            selected.extend(leftovers[:deficit])
+
+        selected = selected[:target_count]
+        selected_ids = {record.id for record in selected}
+        for record in records:
+            bucket = record.metadata.get("difficulty", {}).get("bucket", record.difficulty or "medium")
+            record.metadata["level4"] = {
+                "implemented": True,
+                "bucket": bucket,
+                "selected": record.id in selected_ids,
+                "sampling_ratio": self.ratio,
+            }
+        selected_by_bucket = Counter(record.metadata["level4"]["bucket"] for record in selected)
+        return selected, {
+            "target_count": target_count,
+            "planned_sampling_ratio": self.ratio,
+            "available_by_bucket": available_by_bucket,
+            "selected_by_bucket": dict(selected_by_bucket),
+            "deficit": deficit,
+            "seed": self.seed,
+        }
+
+    def _quotas(self, target_count: int) -> dict[str, int]:
+        total = sum(self.ratio.values())
+        quotas = {bucket: int(target_count * weight / total) for bucket, weight in self.ratio.items()}
+        remaining = target_count - sum(quotas.values())
+        priority = sorted(self.ratio, key=lambda bucket: self.ratio[bucket], reverse=True)
+        for bucket in priority[:remaining]:
+            quotas[bucket] += 1
+        return quotas
+
+    def _rank(self, records: list[TrajectoryRecord]) -> list[TrajectoryRecord]:
+        rng = random.Random(self.seed)
+        decorated = [(rng.random(), record) for record in records]
+        decorated.sort(
+            key=lambda item: (
+                record_composite_score(item[1]),
+                item[1].quality_score,
+                -len(item[1].raw.get("steps") or []),
+                -item[0],
+            ),
+            reverse=True,
+        )
+        return [record for _, record in decorated]
+
+
+@dataclass
+class PartialOutcome:
+    description: str
+    evidence: dict[str, Any]
+    step_index: int
+    confidence: float
+
+
+class FailureDetector:
+    def classify(self, record: TrajectoryRecord) -> dict[str, Any]:
+        level1 = record.metadata.get("level1", {})
+        reason = level1.get("error") or record.raw.get("termination_reason") or "unknown_failure"
+        if level1 and not level1.get("passed") and str(reason) == "success":
+            reason = "verification_failed"
+        text = json.dumps(record.raw.get("steps") or [], ensure_ascii=False).lower()
+        if any(token in text for token in ["timeout", "container", "permission", "fatal"]):
+            failure_type = "tool_error"
+            recoverable = False
+            severity = 0.3
+        elif reason in {"max_steps", "loop_detected"}:
+            failure_type = "incomplete"
+            recoverable = True
+            severity = 0.7
+        elif reason in {"verification_failed", "final_answer_failed"} or "failed" in str(reason):
+            failure_type = "verification_failed"
+            recoverable = True
+            severity = 0.8
+        else:
+            failure_type = str(reason)
+            recoverable = True
+            severity = 0.5
+        return {"failure_type": failure_type, "recoverable": recoverable, "severity_weight": severity, "reason": reason}
+
+
+class OutcomeExtractor:
+    def extract(self, record: TrajectoryRecord, min_confidence: float = 0.2) -> list[PartialOutcome]:
+        outcomes = []
+        for index, step in enumerate(record.raw.get("steps") or []):
+            observation = step.get("observation") or {}
+            content = observation.get("content")
+            if observation.get("success") and content not in (None, ""):
+                confidence = 0.8 if not observation.get("error") else 0.4
+                outcomes.append(
+                    PartialOutcome(
+                        description=f"Successfully produced intermediate result: {str(content)[:500]}",
+                        evidence={"observation": observation, "action": step.get("action") or {}},
+                        step_index=index,
+                        confidence=confidence,
+                    )
+                )
+        return [outcome for outcome in outcomes if outcome.confidence >= min_confidence]
+
+
+class HERRelabeler:
+    def __init__(
+        self,
+        failure_detector: FailureDetector | None = None,
+        outcome_extractor: OutcomeExtractor | None = None,
+        max_per_failed_task: int = 2,
+        min_partial_score: float = 0.2,
+        mode: str = "hybrid",
+        llm_client: Any | None = None,
+        progress: Any | None = None,
+    ):
+        self.failure_detector = failure_detector or FailureDetector()
+        self.outcome_extractor = outcome_extractor or OutcomeExtractor()
+        self.max_per_failed_task = max_per_failed_task
+        self.min_partial_score = min_partial_score
+        self.mode = mode
+        self.llm_client = llm_client
+        self.progress = progress
+
+    def _progress(self, event: str, **payload: Any) -> None:
+        if self.progress is not None:
+            self.progress(event, **payload)
+
+    async def relabel(self, failed_records: list[TrajectoryRecord]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        her_sft = []
+        skipped = Counter()
+        failure_modes = Counter()
+        per_task_counts = Counter()
+        relabelable = 0
+        for index, record in enumerate(failed_records, start=1):
+            self._progress("her:record:start", index=index, total=len(failed_records), record_id=record.id)
+            failure = self.failure_detector.classify(record)
+            failure_modes[failure["failure_type"]] += 1
+            if not failure["recoverable"]:
+                skipped["unrecoverable"] += 1
+                self._progress("her:record:skip", record_id=record.id, reason="unrecoverable")
+                continue
+            if per_task_counts[record.task_id] >= self.max_per_failed_task:
+                skipped["max_per_failed_task"] += 1
+                self._progress("her:record:skip", record_id=record.id, reason="max_per_failed_task")
+                continue
+            outcomes = self.outcome_extractor.extract(record, self.min_partial_score)
+            self._progress("her:heuristic:done", record_id=record.id, candidates=len(outcomes))
+            if self.mode in {"llm", "hybrid"} and self.llm_client is not None:
+                self._progress("her:llm_extract:start", record_id=record.id)
+                llm_outcomes = await self._llm_extract_outcomes(record, failure, outcomes)
+                self._progress("her:llm_extract:done", record_id=record.id, candidates=len(llm_outcomes))
+                if llm_outcomes:
+                    outcomes = llm_outcomes
+            if not outcomes:
+                skipped["no_partial_outcome"] += 1
+                self._progress("her:record:skip", record_id=record.id, reason="no_partial_outcome")
+                continue
+            outcome = max(outcomes, key=lambda item: item.confidence)
+            relabeled = self._to_sft(record, outcome, failure)
+            if self.mode in {"llm", "hybrid"} and self.llm_client is not None:
+                self._progress("her:llm_rewrite_validate:start", record_id=record.id)
+                relabeled = await self._llm_rewrite_and_validate(record, outcome, failure, relabeled)
+                if relabeled is None:
+                    skipped["llm_validation_failed"] += 1
+                    self._progress("her:record:skip", record_id=record.id, reason="llm_validation_failed")
+                    continue
+                self._progress("her:llm_rewrite_validate:done", record_id=record.id)
+            relabelable += 1
+            per_task_counts[record.task_id] += 1
+            her_sft.append(relabeled)
+            self._progress("her:record:done", record_id=record.id, output_count=len(her_sft))
+        return her_sft, {
+            "enabled": True,
+            "input_failed_count": len(failed_records),
+            "relabelable_count": relabelable,
+            "output_her_count": len(her_sft),
+            "failure_mode_counts": dict(failure_modes),
+            "skipped_reasons": dict(skipped),
+        }
+
+    async def _llm_extract_outcomes(
+        self,
+        record: TrajectoryRecord,
+        failure: dict[str, Any],
+        heuristic_outcomes: list[PartialOutcome],
+    ) -> list[PartialOutcome]:
+        prompt = {
+            "failure": failure,
+            "heuristic_outcomes": [asdict(outcome) for outcome in heuristic_outcomes],
+            "trajectory_prefix": record.raw.get("steps", [])[:8],
+        }
+        raw = await self._call_llm(
+            "Extract factual partial achievements from a failed agent trajectory. Return JSON with key achievements, "
+            "a list of objects with description, step_index, confidence.",
+            prompt,
+        )
+        parsed = parse_judge_json(raw)
+        outcomes = []
+        for item in parsed.get("achievements", []):
+            confidence = clamp(float(item.get("confidence", 0.0)))
+            if confidence >= self.min_partial_score:
+                outcomes.append(
+                    PartialOutcome(
+                        description=str(item.get("description", "")),
+                        evidence={"llm_extracted": item},
+                        step_index=int(item.get("step_index", 0)),
+                        confidence=confidence,
+                    )
+                )
+        return outcomes
+
+    async def _llm_rewrite_and_validate(
+        self,
+        record: TrajectoryRecord,
+        outcome: PartialOutcome,
+        failure: dict[str, Any],
+        fallback: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        rewrite_raw = await self._call_llm(
+            "Rewrite this failed trajectory into a hindsight relabelled SFT example for the achieved subgoal. "
+            "Return JSON with system_prompt, user_prompt, final_answer.",
+            {"failure": failure, "partial_outcome": asdict(outcome), "fallback": fallback},
+        )
+        rewrite = parse_judge_json(rewrite_raw)
+        candidate = dict(fallback)
+        candidate["messages"] = [
+            {"role": "system", "content": str(rewrite.get("system_prompt", fallback["messages"][0]["content"]))},
+            {"role": "user", "content": str(rewrite.get("user_prompt", fallback["messages"][1]["content"]))},
+            {"role": "assistant", "content": f"Final Answer: {rewrite.get('final_answer', outcome.description)}"},
+        ]
+        validate_raw = await self._call_llm(
+            "Validate whether the hindsight prompt and final answer are fully supported by the trajectory evidence. "
+            "Return JSON with valid (bool), score (0-1), reason.",
+            {
+                "candidate": candidate,
+                "partial_outcome": asdict(outcome),
+                "trajectory_prefix": record.raw.get("steps", [])[:8],
+            },
+        )
+        validation = parse_judge_json(validate_raw)
+        valid = bool(validation.get("valid", validation.get("passed", False)))
+        score = clamp(float(validation.get("score", 0.0)))
+        if not valid or score < 0.5:
+            return None
+        candidate["metadata"] = {
+            **candidate.get("metadata", {}),
+            "llm_rewrite": rewrite,
+            "llm_validation": validation,
+            "her_mode": self.mode,
+        }
+        return candidate
+
+    async def _call_llm(self, system_prompt: str, payload: dict[str, Any]) -> str:
+        if hasattr(self.llm_client, "achat"):
+            return await self.llm_client.achat(
+                model=getattr(self.llm_client, "model", "default"),
+                messages=[
+                    {"role": "system", "content": system_prompt + " Output ONLY valid JSON."},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.0,
+                max_tokens=1024,
+            )
+        result = self.llm_client(system_prompt, payload)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return str(result)
+
+    def _to_sft(self, record: TrajectoryRecord, outcome: PartialOutcome, failure: dict[str, Any]) -> dict[str, Any]:
+        system = (
+            "This is a hindsight-relabelled AgentHER trajectory. The original task failed, but the trajectory "
+            "successfully achieved the subgoal below. Train only on the achieved subgoal."
+        )
+        user = (
+            "Hindsight subgoal: reproduce the verified partial outcome achieved during the trajectory.\n\n"
+            f"Partial outcome: {outcome.description}"
+        )
+        return {
+            "task_id": f"her_{record.task_id}_{outcome.step_index}",
+            "domain": record.domain,
+            "difficulty": record.difficulty,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": f"Final Answer: {outcome.description}"},
+            ],
+            "metadata": {
+                "her": True,
+                "her_mode": self.mode,
+                "source_record_id": record.id,
+                "source_task_id": record.task_id,
+                "source_raw_path": str(record.raw_path),
+                "failure": failure,
+                "partial_outcome": asdict(outcome),
+            },
+        }
 
 
 class DeduplicatorMinhash:
@@ -620,8 +1345,15 @@ class QualityFilter:
         result_verifier: ResultVerifier | None = None,
         deduplicator: DeduplicatorMinhash | None = None,
         diversity_monitor: DiversityMonitor | None = None,
+        process_reward_scorer: ProcessRewardScorer | None = None,
+        difficulty_classifier: DifficultyClassifier | None = None,
+        difficulty_sampler: DifficultyAwareSampler | None = None,
+        her_relabeler: HERRelabeler | None = None,
+        her_llm_client: Any | None = None,
+        progress: Any | None = None,
     ):
         self.config = config or QualityFilterConfig()
+        self.progress = progress
         self.result_verifier = result_verifier or ResultVerifier()
         self.deduplicator = deduplicator or DeduplicatorMinhash(
             num_perm=self.config.minhash_num_perm,
@@ -635,17 +1367,64 @@ class QualityFilter:
             embedding_diagnostics_top_k=self.config.embedding_diagnostics_top_k,
         )
         self.diversity_monitor = diversity_monitor or DiversityMonitor(self.config.diversity_sample_size)
+        self.difficulty_classifier = difficulty_classifier or DifficultyClassifier(
+            self.config.difficulty_pass32_buckets
+        )
+        self.process_reward_scorer = process_reward_scorer or ProcessRewardScorer(
+            min_score=self.config.level2_min_score,
+            mc_weight=self.config.level2_mc_weight,
+            judge_weight=self.config.level2_judge_weight,
+            judge_consensus=LLMJudgeConsensus(
+                consensus_k=self.config.level2_judge_consensus_k,
+                fail_closed=self.config.level2_fail_closed_on_judge_error,
+            ),
+        )
+        self.difficulty_sampler = difficulty_sampler or DifficultyAwareSampler(
+            ratio=self.config.difficulty_sampling_ratio,
+            seed=self.config.level4_seed,
+        )
+        self.her_relabeler = her_relabeler or HERRelabeler(
+            max_per_failed_task=self.config.her_max_per_failed_task,
+            min_partial_score=self.config.her_min_partial_score,
+            mode=self.config.her_mode,
+            llm_client=her_llm_client,
+            progress=self._progress,
+        )
 
     async def run(self) -> dict[str, Any]:
         task_map = load_task_map(self.config.task_file) if self.config.task_file else {}
+        self._progress("load_records:start")
         records, load_failures = self.load_records()
+        self._progress("load_records:done", total=len(records), failures=len(load_failures))
+        self._progress("difficulty:start", total=len(records))
+        task_stats, difficulty_diagnostics = self.difficulty_classifier.classify(records)
+        self._progress("difficulty:done", tasks=len(task_stats))
+        self._progress("level1:start", total=len(records))
         level1_records, stage1 = await self._run_level1(records, task_map)
-        level2_records, stage2 = self._skip_level2(level1_records)
+        self._progress("level1:done", passed=len(level1_records), total=len(records))
+        level1_failed = [record for record in records if not record.metadata.get("level1", {}).get("passed")]
+        self._progress("her:start", failed=len(level1_failed))
+        her_sft, her_report = await self._run_her(level1_failed)
+        self._progress("her:done", relabeled=len(her_sft))
+        self._progress("level2:start", total=len(level1_records))
+        level2_records, stage2 = await self._run_level2(level1_records, task_map, task_stats)
+        self._progress("level2:done", passed=len(level2_records), total=len(level1_records))
+        self._progress("level3:start", total=len(level2_records))
         level3_records, stage3 = self._run_level3(level2_records)
-        final_records, stage4 = self._skip_level4(level3_records)
+        self._progress("level3:done", passed=len(level3_records), total=len(level2_records))
+        self._apply_composite_scores(level2_records)
+        self._progress("level4:start", total=len(level3_records))
+        final_records, stage4 = self._run_level4(level3_records)
+        self._progress("level4:done", selected=len(final_records), total=len(level3_records))
 
         stage1.failures.extend(load_failures)
         stages = [stage1, stage2, stage3, stage4]
+        base_sft_count = len([record for record in final_records if record.sft is not None])
+        her_report["before_sft_count"] = base_sft_count
+        her_report["after_sft_count"] = base_sft_count + len(her_sft)
+        filtered_sft = [record.sft for record in final_records if record.sft is not None]
+        if self.config.her_include_in_filtered_sft:
+            filtered_sft.extend(her_sft)
         return {
             "created_at": datetime.now().isoformat(),
             "config": self.config.to_dict(),
@@ -653,13 +1432,23 @@ class QualityFilter:
                 "input_count": len(records),
                 "final_count": len(final_records),
                 "overall_pass_rate": len(final_records) / len(records) if records else 0.0,
+                "her_count": len(her_sft),
+                "filtered_sft_count": len([record for record in final_records if record.sft is not None]),
+                "filtered_sft_with_her_count": len(filtered_sft),
             },
             "funnel": [stage.to_dict() for stage in stages],
+            "difficulty_diagnostics": difficulty_diagnostics,
+            "her_relabeling": her_report,
+            "her_sft": her_sft,
             "kept": [record.summary() for record in final_records],
             "filtered": [record.summary() for record in records if record not in final_records],
             "failures": [failure for stage in stages for failure in stage.failures],
-            "filtered_sft": [record.sft for record in final_records if record.sft is not None],
+            "filtered_sft": filtered_sft,
         }
+
+    def _progress(self, event: str, **payload: Any) -> None:
+        if self.progress is not None:
+            self.progress(event, **payload)
 
     def load_records(self) -> tuple[list[TrajectoryRecord], list[dict[str, Any]]]:
         failures: list[dict[str, Any]] = []
@@ -736,6 +1525,70 @@ class QualityFilter:
             )
         return passed, StageResult("level1_result_verifier", True, len(records), len(passed), failures=failures)
 
+    async def _run_level2(
+        self,
+        records: list[TrajectoryRecord],
+        task_map: dict[str, dict[str, Any]],
+        task_stats: dict[str, TaskPassStats],
+    ) -> tuple[list[TrajectoryRecord], StageResult]:
+        if not self.config.enable_level2_prm:
+            return self._skip_level2(records)
+        scored = []
+        failures = []
+        scores = []
+        step_score_count = 0
+        for index, record in enumerate(records, start=1):
+            self._progress("level2:record:start", index=index, total=len(records), record_id=record.id)
+            result = await self.process_reward_scorer.score_record(
+                record,
+                task_map.get(record.task_id),
+                task_stats.get(record.task_id),
+            )
+            record.quality_score = result.score
+            record.quality_score_source = "level2_prm_soft_score"
+            record.metadata["level2"] = {
+                "implemented": True,
+                "passed": result.passed,
+                "score": result.score,
+                "threshold": self.config.level2_min_score,
+                "step_scores": [step.to_dict() for step in result.step_scores],
+                "judge_consensus": result.judge_consensus,
+                "mc_metadata": result.mc_metadata,
+            }
+            scores.append(result.score)
+            step_score_count += len(result.step_scores)
+            self._progress(
+                "level2:record:done",
+                index=index,
+                total=len(records),
+                record_id=record.id,
+                score=round(result.score, 4),
+                passed=result.passed,
+            )
+            if result.passed:
+                scored.append(record)
+            else:
+                failures.append({"id": record.id, "task_id": record.task_id, "reason": "low_prm_score"})
+        return scored, StageResult(
+            "level2_prm_mc_llm_judge",
+            True,
+            len(records),
+            len(scored),
+            metadata={
+                "min_score": self.config.level2_min_score,
+                "mean_prm_score": sum(scores) / len(scores) if scores else 0.0,
+                "min_prm_score": min(scores) if scores else 0.0,
+                "max_prm_score": max(scores) if scores else 0.0,
+                "filtered_below_threshold": len(records) - len(scored),
+                "per_step_score_count": step_score_count,
+                "judge_enabled": any(
+                    not record.metadata.get("level2", {}).get("judge_consensus", {}).get("skipped", True)
+                    for record in records
+                ),
+            },
+            failures=failures,
+        )
+
     @staticmethod
     def _skip_level2(records: list[TrajectoryRecord]) -> tuple[list[TrajectoryRecord], StageResult]:
         for record in records:
@@ -772,6 +1625,44 @@ class QualityFilter:
             },
         )
 
+    async def _run_her(self, failed_records: list[TrajectoryRecord]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if not self.config.enable_her_relabeling:
+            return [], {"enabled": False, "input_failed_count": len(failed_records), "output_her_count": 0}
+        her_sft, report = await self.her_relabeler.relabel(failed_records)
+        report["included_in_filtered_sft"] = self.config.her_include_in_filtered_sft
+        return her_sft, report
+
+    def _apply_composite_scores(self, records: list[TrajectoryRecord]) -> None:
+        for record in records:
+            correct = 1.0 if record.metadata.get("level1", {}).get("passed") else 0.0
+            prm = float(record.metadata.get("level2", {}).get("score", record.quality_score) or 0.0)
+            level3 = record.metadata.get("level3", {})
+            diversity = 1.0 if level3.get("kept", True) else 0.0
+            similarity = level3.get("similarity") or {}
+            if similarity.get("embedding_similarity") is not None:
+                diversity = max(0.0, 1.0 - float(similarity["embedding_similarity"]))
+            composite = 0.4 * correct + 0.3 * prm + 0.2 * diversity
+            record.metadata["composite_score"] = {
+                "formula": "0.4*1[correct]+0.3*PRM+0.2*diversity",
+                "correct_component": correct,
+                "prm_component": prm,
+                "diversity_component": diversity,
+                "score": composite,
+                "formula_weight_sum": 0.9,
+            }
+
+    def _run_level4(self, records: list[TrajectoryRecord]) -> tuple[list[TrajectoryRecord], StageResult]:
+        if not self.config.enable_level4_sampling:
+            return self._skip_level4(records)
+        selected, metadata = self.difficulty_sampler.sample(records, self.config.level4_target_count)
+        return selected, StageResult(
+            "level4_difficulty_aware_sampling",
+            True,
+            len(records),
+            len(selected),
+            metadata=metadata,
+        )
+
     @staticmethod
     def _skip_level4(records: list[TrajectoryRecord]) -> tuple[list[TrajectoryRecord], StageResult]:
         for record in records:
@@ -792,6 +1683,22 @@ class QualityFilter:
                 "planned_sampling_ratio": "1:3:4:2",
             },
         )
+
+
+def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def parse_judge_json(raw: str) -> dict[str, Any]:
+    text = str(raw).strip()
+    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text).strip()
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    return json.loads(match.group(0) if match else text)
+
+
+def record_composite_score(record: TrajectoryRecord) -> float:
+    return float(record.metadata.get("composite_score", {}).get("score", record.quality_score) or 0.0)
 
 
 def encode_texts_with_transformers(texts: list[str], model_name: str, batch_size: int = 32) -> list[list[float]]:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -14,10 +16,42 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from agent_sft.quality_filter import (  # noqa: E402
     DEDUP_TEXT_PRESETS,
     DedupTextConfig,
+    LLMJudgeConsensus,
+    LLMMCEstimator,
+    ProcessRewardScorer,
     QualityFilter,
     QualityFilterConfig,
 )
 from agent_sft.quality_filter.quality_filter import write_quality_outputs  # noqa: E402
+from infra.vllm_client.client import VLLMClient  # noqa: E402
+
+
+class RateLimitedJudge:
+    def __init__(self, inner: VLLMClient, sleep_min: float, sleep_max: float):
+        self.inner = inner
+        self.model = inner.model
+        self.sleep_min = sleep_min
+        self.sleep_max = sleep_max
+
+    async def achat(self, *args, **kwargs):
+        if self.sleep_max > 0:
+            await asyncio.sleep(random.uniform(self.sleep_min, self.sleep_max))
+        return await self.inner.achat(*args, **kwargs)
+
+
+def print_progress(event: str, **payload) -> None:
+    if payload:
+        details = " ".join(f"{key}={value}" for key, value in payload.items())
+        print(f"[quality_filter] {event} {details}", flush=True)
+    else:
+        print(f"[quality_filter] {event}", flush=True)
+
+
+def parse_ratio(value: str) -> dict[str, int]:
+    parts = [int(part) for part in value.split(":")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("ratio must have four parts, e.g. 1:3:4:2")
+    return dict(zip(["easy", "medium", "hard", "extreme"], parts))
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +80,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--embedding-diagnostics-top-k", type=int, default=50)
     parser.add_argument("--enable-embedding-dedup", action="store_true")
+    parser.add_argument("--enable-level2-prm", dest="enable_level2_prm", action="store_true", default=True)
+    parser.add_argument("--disable-level2-prm", dest="enable_level2_prm", action="store_false")
+    parser.add_argument("--level2-min-score", type=float, default=0.5)
+    parser.add_argument("--level2-mc-weight", type=float, default=0.5)
+    parser.add_argument("--level2-judge-weight", type=float, default=0.5)
+    parser.add_argument("--level2-judge-consensus-k", type=int, default=3)
+    parser.add_argument("--level2-offline-mc-mode", default="hybrid")
+    parser.add_argument("--enable-level2-llm-judge", dest="enable_level2_llm_judge", action="store_true", default=True)
+    parser.add_argument("--disable-level2-llm-judge", dest="enable_level2_llm_judge", action="store_false")
+    parser.add_argument("--enable-level2-llm-mc", dest="enable_level2_llm_mc", action="store_true", default=True)
+    parser.add_argument("--disable-level2-llm-mc", dest="enable_level2_llm_mc", action="store_false")
+    parser.add_argument("--level2-mc-rollouts", type=int, default=5)
+    parser.add_argument(
+        "--level2-judge-base-url",
+        default=os.getenv("VLLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"),
+    )
+    parser.add_argument("--level2-judge-model", default=os.getenv("VLLM_MODEL", "doubao-seed-2.0-lite"))
+    parser.add_argument("--level2-judge-api-key", default=os.getenv("ANTHROPIC_AUTH_TOKEN"))
+    parser.add_argument("--level2-judge-sleep-min", type=float, default=0.0)
+    parser.add_argument("--level2-judge-sleep-max", type=float, default=0.0)
+    parser.add_argument("--level2-judge-fail-closed", action="store_true")
+    parser.add_argument("--enable-level4-sampling", dest="enable_level4_sampling", action="store_true", default=True)
+    parser.add_argument("--disable-level4-sampling", dest="enable_level4_sampling", action="store_false")
+    parser.add_argument("--difficulty-sampling-ratio", type=parse_ratio, default=parse_ratio("1:3:4:2"))
+    parser.add_argument("--level4-target-count", type=int, default=None)
+    parser.add_argument("--level4-seed", type=int, default=0)
+    parser.add_argument("--enable-her-relabeling", dest="enable_her_relabeling", action="store_true", default=True)
+    parser.add_argument("--disable-her-relabeling", dest="enable_her_relabeling", action="store_false")
+    parser.add_argument("--her-include-in-filtered-sft", action="store_true")
+    parser.add_argument("--her-mode", choices=["heuristic", "llm", "hybrid"], default="hybrid")
+    parser.add_argument("--her-max-per-failed-task", type=int, default=2)
+    parser.add_argument("--her-min-partial-score", type=float, default=0.2)
+    parser.add_argument("--her-json", type=Path, default=None)
     parser.add_argument("--fail-open-missing-task", action="store_true")
     parser.add_argument("--report-json", type=Path, default=None)
     parser.add_argument("--filtered-json", type=Path, default=None)
@@ -89,12 +156,68 @@ async def async_main() -> None:
         enable_embedding_dedup=args.enable_embedding_dedup,
         embedding_model=args.embedding_model,
         embedding_diagnostics_top_k=args.embedding_diagnostics_top_k,
+        enable_level2_prm=args.enable_level2_prm,
+        level2_min_score=args.level2_min_score,
+        level2_mc_weight=args.level2_mc_weight,
+        level2_judge_weight=args.level2_judge_weight,
+        level2_judge_consensus_k=args.level2_judge_consensus_k,
+        level2_fail_closed_on_judge_error=args.level2_judge_fail_closed,
+        level2_offline_mc_mode=args.level2_offline_mc_mode,
+        enable_level4_sampling=args.enable_level4_sampling,
+        difficulty_sampling_ratio=args.difficulty_sampling_ratio,
+        level4_target_count=args.level4_target_count,
+        level4_seed=args.level4_seed,
+        enable_her_relabeling=args.enable_her_relabeling,
+        her_include_in_filtered_sft=args.her_include_in_filtered_sft,
+        her_mode=args.her_mode,
+        her_max_per_failed_task=args.her_max_per_failed_task,
+        her_min_partial_score=args.her_min_partial_score,
         fail_open_missing_task=args.fail_open_missing_task,
     )
 
-    quality_filter = QualityFilter(config)
+    process_reward_scorer = None
+    judge_client = None
+    if args.enable_level2_llm_judge or args.enable_level2_llm_mc or args.her_mode in {"llm", "hybrid"}:
+        judge_client = RateLimitedJudge(
+            VLLMClient(
+                base_url=args.level2_judge_base_url,
+                api_key=args.level2_judge_api_key,
+                timeout=120,
+                model=args.level2_judge_model,
+            ),
+            args.level2_judge_sleep_min,
+            args.level2_judge_sleep_max,
+        )
+        if args.enable_level2_llm_judge or args.enable_level2_llm_mc:
+            process_reward_scorer = ProcessRewardScorer(
+                mc_estimator=LLMMCEstimator(
+                    judge_client,
+                    rollouts=args.level2_mc_rollouts,
+                    fail_closed=args.level2_judge_fail_closed,
+                )
+                if args.enable_level2_llm_mc
+                else None,
+                judge_consensus=LLMJudgeConsensus(
+                    judge_client=judge_client if args.enable_level2_llm_judge else None,
+                    consensus_k=args.level2_judge_consensus_k,
+                    fail_closed=args.level2_judge_fail_closed,
+                ),
+                min_score=args.level2_min_score,
+                mc_weight=args.level2_mc_weight,
+                judge_weight=args.level2_judge_weight,
+            )
+
+    quality_filter = QualityFilter(
+        config,
+        process_reward_scorer=process_reward_scorer,
+        her_llm_client=judge_client,
+        progress=print_progress,
+    )
     report = await quality_filter.run()
     write_quality_outputs(report, report_path, filtered_path)
+    if args.her_json is not None:
+        args.her_json.parent.mkdir(parents=True, exist_ok=True)
+        args.her_json.write_text(json.dumps(report.get("her_sft", []), ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
     print("\nFunnel pass rates:")
