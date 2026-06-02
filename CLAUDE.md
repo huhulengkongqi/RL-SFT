@@ -63,6 +63,19 @@ uv run python scripts/start_local_vllm.py
 
 Docker is required for the real environment sandbox tests and demos. GPU/vLLM workflows additionally require NVIDIA Docker support and a compatible CUDA driver.
 
+### Quality filter utilities
+
+```bash
+# Run trajectory quality filter pipeline
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_quality_filter.py \
+  --input data/sft_trajectories/batch_trajectories.jsonl \
+  --output-dir data/quality_filter \
+  --sleep-min 8 --sleep-max 12
+
+# Analyze filter report and generate summary statistics
+uv run python scripts/analyze_quality_filter_report.py data/quality_filter/filter_report.json
+```
+
 ## Pipeline scripts
 
 ```bash
@@ -88,9 +101,30 @@ ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/generate_all_trajectorie
 # Best-of-N trajectory sampling and benchmarking
 ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/trajectory_sample.py --domain code_debug --limit 1 --n 4
 ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/trajectory_sample.py --benchmark --benchmark-tasks 100 --n 16 --task-concurrency 1
+
+# Trajectory quality filter funnel
+ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_quality_filter.py \
+  --input data/sft_trajectories/batch_trajectories.jsonl \
+  --output-dir data/quality_filter
+uv run python scripts/analyze_quality_filter_report.py data/quality_filter/filter_report.json
 ```
 
 `run_evolution.py --use-mock` is the fastest smoke test because it exercises pipeline logic without real LLM calls. Scripts in `scripts/archive/` are historical data-prep utilities rather than current entry points.
+
+### Pipeline script reference
+
+| Script | Purpose |
+|---|---|
+| `run_evolution.py` | Multi-generation Evol-Instruct task evolution |
+| `assess_evolution.py` | Evolution result statistics and quality metrics |
+| `generate_seed_prompts.py` | Base seed pool generation across 4 domains |
+| `fix_math_references_with_llm.py` | Batch-correct math reference solutions |
+| `generate_single_trajectory_real_env.py` | Single trajectory generation in real Environment |
+| `generate_all_trajectories_real_env.py` | Batch trajectory generation with resume support |
+| `quality_assessment.py` | Seed/evolved data quality scoring |
+| `trajectory_sample.py` | Best-of-N concurrent trajectory sampling |
+| `run_quality_filter.py` | Trajectory quality filter funnel pipeline |
+| `analyze_quality_filter_report.py` | Filter report analysis and summary stats |
 
 ## Architecture
 
@@ -98,10 +132,19 @@ ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/trajectory_sample.py --b
 
 - `task_generator/` defines seed/task Pydantic models, seed-pool sampling/versioning, LLM-based task generation, AST function-call parsing, and task validation.
 - `evol_instruct/` implements the multi-generation Evol-Instruct pipeline. `evolver.py` applies evolution strategies; `pipeline.py` orchestrates evolve → deduplicate → quality filter → stats.
-- `quality_filter/` contains embedding deduplication, LLM quality discrimination, and diversity metrics.
+- `quality_filter/` contains the **trajectory quality filter funnel**: embedding-based deduplication, LLM quality discrimination (reasoning quality, tool usage, correctness), diversity metrics, and comprehensive report generation.
 - `trajectory_sampler/agent_loop.py` contains the teacher-agent harness: immutable `AgentState`, termination detection, trajectory recording, ReAct/function-JSON formatting, and layered Observation→Thought→Action generation.
 - `trajectory_sampler/trajectory_sample.py` implements best-of-N concurrent sampling, trajectory ranking, failure summaries, and sandbox failure detection.
 - `dataset_builder/` is currently only a package stub.
+
+#### Four task domains and sources
+
+| Domain | Source examples | Target task type |
+|---|---|---|
+| `code_debug` | StackOverflow, real Python bugs, SDK examples | Debugging, fixing, explaining bugs |
+| `math_reasoning` | Math reasoning datasets | Step-by-step reasoning, numeric answers |
+| `api_orchestration` | OpenAPI, SDK, FastAPI examples | API call sequencing, error handling, auth flows |
+| `multi_step_planning` | Ansible, CI/CD workflows, deployment samples | Multi-phase planning, dependencies, risk control |
 
 ### `src/infra`: execution and model clients
 
@@ -123,9 +166,18 @@ SeedPromptPool
   → SandboxPool / AnswerVerifier
   → TrajectoryRecorder
   → raw trajectory JSON + SFT JSON
+  → QualityFilterFunnel (deduplication → quality scoring → diversity)
+  → final curated SFT dataset
 ```
 
 LLM clients are duck-typed around `chat()`, `achat()`, and `achat_stream()` where available. Most pipeline code accepts an injected client rather than constructing one internally. Trajectory generation scripts wrap clients with explicit randomized sleep before each API/Judge call.
+
+### Environment requirements
+
+- Python 3.11+
+- `uv` package manager
+- Docker (required for Environment / sandbox tests)
+- Optional: NVIDIA GPU + vLLM Docker for local inference
 
 ## Verification modes
 

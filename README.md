@@ -199,7 +199,45 @@ data/sft_trajectories/realenv_<task_id>_<timestamp>_raw.json
 data/sft_trajectories/realenv_<task_id>_<timestamp>_sft.json
 ```
 
-### 6. 当前验证策略
+### 6. Trajectory Quality Filter Funnel
+
+生成的轨迹经过质量过滤漏斗筛选，确保最终 SFT 数据的高质量：
+
+```text
+raw trajectories
+  ↓
+embedding deduplication  (去重相似轨迹)
+  ↓
+LLM quality discrimination  (推理质量、工具使用、正确性评分)
+  ↓
+diversity metrics  (多样性筛选)
+  ↓
+final curated SFT dataset
+```
+
+主脚本：
+
+```bash
+set ANTHROPIC_AUTH_TOKEN=your_api_key
+uv run python scripts/run_quality_filter.py \
+  --input data/sft_trajectories/batch_trajectories.jsonl \
+  --output-dir data/quality_filter \
+  --sleep-min 8 \
+  --sleep-max 12
+
+uv run python scripts/analyze_quality_filter_report.py \
+  data/quality_filter/filter_report.json
+```
+
+输出：
+
+```text
+data/quality_filter/filtered_trajectories.jsonl
+data/quality_filter/filter_report.json
+data/quality_filter/diversity_analysis.json
+```
+
+### 7. 当前验证策略
 
 真实环境入口：
 
@@ -272,8 +310,8 @@ src/
 ├── agent_sft/
 │   ├── task_generator/          # SeedPrompt / Task 结构、生成、校验
 │   ├── evol_instruct/           # Evol-Instruct 策略与多代进化
-│   ├── quality_filter/          # 去重、质量判别、统计
-│   ├── trajectory_sampler/      # AgentLoop / AgentState / TrajectoryRecorder
+│   ├── quality_filter/          # Trajectory 质量过滤漏斗：embedding去重、LLM质量判别、多样性指标
+│   ├── trajectory_sampler/      # AgentLoop / AgentState / TrajectoryRecorder / Best-of-N采样
 │   └── dataset_builder/         # SFT 数据格式化（待扩展）
 └── infra/
     ├── vllm_client/             # OpenAI-compatible 客户端；也用于火山 coding/v3
@@ -281,6 +319,15 @@ src/
     ├── environment/             # Agent 交互环境、AnswerVerifier、SandboxPool
     └── sandbox/                 # Docker sandbox 执行管理
 ```
+
+### 四个任务领域与来源
+
+| Domain | 来源示例 | 目标任务类型 |
+|---|---|---|
+| `code_debug` | StackOverflow、真实 Python bug、SDK 示例 | 调试、修复、解释 bug |
+| `math_reasoning` | 数学推理数据集 | 逐步推理、数值答案 |
+| `api_orchestration` | OpenAPI、SDK、FastAPI 示例 | API 调用顺序、错误处理、鉴权流程 |
+| `multi_step_planning` | Ansible、CI/CD workflow、部署样例 | 多阶段计划、依赖、风险控制 |
 
 ## 环境要求
 
@@ -343,7 +390,11 @@ uv run mypy src/
 | `scripts/generate_seed_prompts.py` | 生成基础 seed pool |
 | `scripts/fix_math_references_with_llm.py` | 批量修正数学参考答案 |
 | `scripts/generate_single_trajectory_real_env.py` | 使用真实 Environment 生成单条轨迹 |
+| `scripts/generate_all_trajectories_real_env.py` | 批量生成轨迹，支持断点续跑 |
 | `scripts/quality_assessment.py` | seed/evolved 数据质量评估 |
+| `scripts/trajectory_sample.py` | Best-of-N 并发采样和基准测试 |
+| `scripts/run_quality_filter.py` | Trajectory 质量过滤漏斗管线 |
+| `scripts/analyze_quality_filter_report.py` | 过滤报告分析和统计摘要 |
 | `scripts/demo_task_generator.py` | task generation demo |
 | `scripts/demo_task_validation.py` | sandbox validation demo |
 
@@ -357,6 +408,7 @@ uv run mypy src/
 | `data/claude_evolved_4gen/final_evolved_v1.0_complete.json` | 4 代进化后的完整 task 数据 |
 | `data/reference_checks/` | LLM 参考答案审核/修正报告 |
 | `data/sft_trajectories/` | AgentLoop 生成的 raw/SFT 轨迹 |
+| `data/quality_filter/` | Trajectory 质量过滤输出和报告 |
 
 ## 许可证
 
