@@ -955,7 +955,10 @@ class HERRelabeler:
             "Return JSON with system_prompt, user_prompt, final_answer.",
             {"failure": failure, "partial_outcome": asdict(outcome), "fallback": fallback},
         )
-        rewrite = parse_judge_json(rewrite_raw)
+        try:
+            rewrite = parse_judge_json(rewrite_raw)
+        except json.JSONDecodeError:
+            return fallback
         candidate = dict(fallback)
         candidate["messages"] = [
             {"role": "system", "content": str(rewrite.get("system_prompt", fallback["messages"][0]["content"]))},
@@ -971,7 +974,10 @@ class HERRelabeler:
                 "trajectory_prefix": record.raw.get("steps", [])[:8],
             },
         )
-        validation = parse_judge_json(validate_raw)
+        try:
+            validation = parse_judge_json(validate_raw)
+        except json.JSONDecodeError:
+            return None
         valid = bool(validation.get("valid", validation.get("passed", False)))
         score = clamp(float(validation.get("score", 0.0)))
         if not valid or score < 0.5:

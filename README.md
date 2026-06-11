@@ -237,7 +237,50 @@ data/quality_filter/filter_report.json
 data/quality_filter/diversity_analysis.json
 ```
 
-### 7. 当前验证策略
+### 7. SFT 数据格式化（训练就绪）
+
+过滤后的轨迹转换为标准 HuggingFace `trl.SFTTrainer` 兼容的 chat 格式：
+
+```text
+filtered trajectories
+  ↓
+DataFormatter (ReAct / function_json 格式)
+  ↓
+TokenCounter (chat template 精确计数)
+  ↓
+TrajectoryTruncator (middle/head/tail 截断策略)
+  ↓
+LossMaskBuilder (scratchpad 掩码、长thought屏蔽)
+  ↓
+DatasetExporter (JSONL / Parquet 导出)
+```
+
+主脚本：
+
+```bash
+# 使用合成数据测试 formatter
+uv run python scripts/sft_formatter_full_test.py
+
+# 处理真实轨迹并导出
+uv run python scripts/sft_formatter_full_test.py \
+  --data-dir data/sft_trajectories --limit 50 \
+  --strategy middle --max-tokens 3277 \
+  --output-dir data/formatted_sft --export-format both
+
+# 使用 function_json 工具调用格式（而非 ReAct 文本格式）
+uv run python scripts/sft_formatter_full_test.py --format function_json
+
+# 自定义loss掩码设置（thought 超过 200 tokens 就屏蔽）
+uv run python scripts/sft_formatter_full_test.py --thought-max-tokens 200
+```
+
+输出：
+```text
+data/formatted_sft/formatted_sft.jsonl
+data/formatted_sft/formatted_sft.parquet
+```
+
+### 8. 当前验证策略
 
 真实环境入口：
 
@@ -312,7 +355,7 @@ src/
 │   ├── evol_instruct/           # Evol-Instruct 策略与多代进化
 │   ├── quality_filter/          # Trajectory 质量过滤漏斗：embedding去重、LLM质量判别、多样性指标
 │   ├── trajectory_sampler/      # AgentLoop / AgentState / TrajectoryRecorder / Best-of-N采样
-│   └── dataset_builder/         # SFT 数据格式化（待扩展）
+│   └── dataset_builder/         # SFT 数据格式化：4角色chat模板、token计数、截断策略、loss掩码、Parquet/JSONL导出
 └── infra/
     ├── vllm_client/             # OpenAI-compatible 客户端；也用于火山 coding/v3
     ├── anthropic_client/        # Anthropic native protocol 客户端
@@ -395,6 +438,7 @@ uv run mypy src/
 | `scripts/trajectory_sample.py` | Best-of-N 并发采样和基准测试 |
 | `scripts/run_quality_filter.py` | Trajectory 质量过滤漏斗管线 |
 | `scripts/analyze_quality_filter_report.py` | 过滤报告分析和统计摘要 |
+| `scripts/sft_formatter_full_test.py` | SFT 数据格式化：原始轨迹转训练用chat格式、截断、loss掩码 |
 | `scripts/demo_task_generator.py` | task generation demo |
 | `scripts/demo_task_validation.py` | sandbox validation demo |
 
@@ -409,6 +453,7 @@ uv run mypy src/
 | `data/reference_checks/` | LLM 参考答案审核/修正报告 |
 | `data/sft_trajectories/` | AgentLoop 生成的 raw/SFT 轨迹 |
 | `data/quality_filter/` | Trajectory 质量过滤输出和报告 |
+| `data/formatted_sft/` | 训练就绪的SFT数据（chat模板格式、JSONL/Parquet、带loss掩码） |
 
 ## 许可证
 

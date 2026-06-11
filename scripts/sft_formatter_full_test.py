@@ -9,11 +9,14 @@ Usage:
     # Test with real data directory
     python scripts/sft_formatter_full_test.py --data-dir data/sft_trajectories --limit 10
 
+    # Load from quality filter report (only format filtered trajectories)
+    python scripts/sft_formatter_full_test.py --quality-report data/quality_filter/quality_filter_report.json
+
     # Test different truncation strategies
     python scripts/sft_formatter_full_test.py --strategy middle --max-tokens 4096
 
-    # Full pipeline with export
-    python scripts/sft_formatter_full_test.py --data-dir data/sft_trajectories --limit 50 \\
+    # Full pipeline with export (filtered trajectories from quality report)
+    python scripts/sft_formatter_full_test.py --quality-report data/quality_filter/quality_filter_report.json \\
         --output-dir data/formatted_sft --export-format both
 
     # Custom loss mask settings
@@ -36,6 +39,7 @@ from agent_sft.dataset_builder import (
     TruncationConfig,
     LossMaskConfig,
     TokenCounter,
+    ExportConfig,
 )
 
 
@@ -59,6 +63,63 @@ def load_raw_trajectories(data_dir: str, limit: int = None) -> List[Dict[str, An
                     print(f"  Skip {f.name}: no 'steps' field (already formatted?)")
         except Exception as e:
             print(f"  Error loading {f.name}: {e}")
+
+    return trajectories
+
+
+def load_trajectories_from_quality_report(report_path: str, limit: int = None) -> List[Dict[str, Any]]:
+    """Load raw trajectories referenced by a quality filter report's 'kept' list.
+
+    Args:
+        report_path: Path to quality_filter_report_*.json
+        limit: Maximum number of trajectories to load
+
+    Returns:
+        List of raw trajectory dicts with 'steps' field
+    """
+    path = Path(report_path)
+    with open(path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+
+    kept_entries = report.get("kept", [])
+    if limit:
+        kept_entries = kept_entries[:limit]
+
+    trajectories = []
+    for entry in kept_entries:
+        raw_path = entry.get("raw_path")
+        if not raw_path:
+            continue
+
+        # Resolve path: try relative to cwd first, then relative to report dir
+        raw_path_obj = Path(raw_path)
+        if not raw_path_obj.is_absolute():
+            if not raw_path_obj.exists():
+                alt_path = path.parent / raw_path_obj
+                if alt_path.exists():
+                    raw_path_obj = alt_path
+
+        try:
+            with open(raw_path_obj, "r", encoding="utf-8") as f:
+                traj = json.load(f)
+        except FileNotFoundError:
+            print(f"  Skip missing file: {raw_path}")
+            continue
+        except Exception as e:
+            print(f"  Error loading {raw_path}: {e}")
+            continue
+
+        if "steps" in traj:
+            # Attach quality metadata for later use
+            traj["_quality_metadata"] = {
+                "quality_score": entry.get("quality_score"),
+                "quality_score_source": entry.get("quality_score_source"),
+                "difficulty_bucket": entry.get("difficulty"),
+                "domain": entry.get("domain"),
+            }
+            trajectories.append(traj)
+        else:
+            print(f"  Skip {raw_path}: no 'steps' field")
 
     return trajectories
 
@@ -116,12 +177,19 @@ def print_statistics(name: str, values: List[int]) -> None:
 def main():
     parser = argparse.ArgumentParser(description="SFT Data Formatter Test Script")
 
-    # Data source
-    parser.add_argument(
+    # Data source (mutually exclusive)
+    data_group = parser.add_mutually_exclusive_group()
+    data_group.add_argument(
         "--data-dir",
         type=str,
         default=None,
         help="Directory containing *_raw.json files (default: use synthetic data)",
+    )
+    data_group.add_argument(
+        "--quality-report",
+        type=str,
+        default=None,
+        help="QualityFilter report JSON; load raw trajectories from report['kept'][*]['raw_path']",
     )
     parser.add_argument(
         "--limit",
@@ -271,6 +339,7 @@ def main():
             thought_max_tokens=args.thought_max_tokens,
         ),
         tokenizer_model=args.tokenizer_model,
+        export=ExportConfig(format=args.export_format),
     )
 
     print("=" * 70)
@@ -294,7 +363,14 @@ def main():
 
     # Load data
     print("\n[Loading Data]")
-    if args.data_dir:
+    if args.quality_report:
+        print(f"  Loading from quality report: {args.quality_report}")
+        trajectories = load_trajectories_from_quality_report(args.quality_report, args.limit)
+        print(f"  Loaded: {len(trajectories)} filtered trajectories")
+        if not trajectories:
+            print("  ERROR: No valid filtered trajectories found!")
+            return 1
+    elif args.data_dir:
         print(f"  Loading from: {args.data_dir}")
         trajectories = load_raw_trajectories(args.data_dir, args.limit)
         print(f"  Loaded: {len(trajectories)} valid raw trajectories")
@@ -331,6 +407,11 @@ def main():
 
         # Full pipeline (with truncation)
         result = pipeline.process_trajectory(traj)
+
+        # Preserve quality filter metadata if present
+        if "_quality_metadata" in traj:
+            result.update(traj["_quality_metadata"])
+
         results.append(result)
 
         count_after = result["token_count"]

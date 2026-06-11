@@ -18,15 +18,17 @@ The project is not a model-training repo; it prepares high-quality task and traj
 
 ```bash
 uv sync
-cp .env.example .env  # if local credentials/config are needed
+uv sync --extra sandbox   # Docker sandbox test/dev dependencies
+uv sync --extra dataset   # HuggingFace datasets/pyarrow export dependencies
+cp .env.example .env      # if local credentials/config are needed
 ```
 
 Important env vars used by scripts:
 
-- `ANTHROPIC_AUTH_TOKEN`: Volcano/Claude-compatible API key.
-- `VOLCANO_CLAUDE_BASE_URL`: defaults to `https://ark.cn-beijing.volces.com/api/coding/v3` in scripts.
-- `VLLM_BASE_URL`: default local vLLM OpenAI-compatible endpoint, usually `http://localhost:8000/v1`.
-- `VLLM_MODEL`: default local model, usually `Qwen/Qwen2.5-7B-Instruct-AWQ`.
+- `ANTHROPIC_AUTH_TOKEN`: Volcano/Claude-compatible API key used by trajectory generation, evolution, judge calls, and some tests.
+- `VOLCANO_CLAUDE_BASE_URL`: defaults to `https://ark.cn-beijing.volces.com/api/coding/v3` in scripts that use the native Volcano Claude client.
+- `VLLM_BASE_URL`: default local vLLM/OpenAI-compatible endpoint, usually `http://localhost:8000/v1`; some judge scripts default to Volcano `coding/v3` if unset.
+- `VLLM_MODEL`: default local/judge model name; `.env.example` uses `Qwen/Qwen2.5-7B-Instruct-AWQ` for local vLLM, while several scripts default to `doubao-seed-2.0-lite`.
 
 ### Tests
 
@@ -35,9 +37,11 @@ uv run pytest
 uv run pytest tests/validation/ -v                         # offline validation tests
 uv run pytest tests/validation/test_seed_pool.py -v         # one test file
 uv run pytest tests/validation/test_seed_pool.py::TestSeedPromptPool::test_weighted_sampling -v
+uv run pytest tests/test_agent_loop.py -v                  # mocked Environment, no Docker required
+uv run pytest tests/test_trajectory_sample.py -v           # best-of-N utilities, no real API required
+uv run pytest tests/test_quality_filter.py -v              # quality funnel unit coverage
+uv run pytest tests/test_data_formatter.py -v              # SFT formatter; export tests are skipped without optional deps
 uv run pytest tests/infra/environment/test_environment.py -v # requires Docker sandbox
-uv run pytest tests/test_agent_loop.py -v
-uv run pytest tests/test_trajectory_sample.py -v
 ```
 
 `pytest.ini` sets `testpaths = tests`, `pythonpath = src`, verbose short tracebacks, and `asyncio_mode = auto`.
@@ -66,14 +70,15 @@ Docker is required for the real environment sandbox tests and demos. GPU/vLLM wo
 ### Quality filter utilities
 
 ```bash
-# Run trajectory quality filter pipeline
+# Run trajectory quality filter pipeline over *_raw.json trajectory files
 ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_quality_filter.py \
-  --input data/sft_trajectories/batch_trajectories.jsonl \
+  --input-dir data/sft_trajectories \
+  --raw-glob "*_raw.json" \
   --output-dir data/quality_filter \
-  --sleep-min 8 --sleep-max 12
+  --level2-judge-sleep-min 8 --level2-judge-sleep-max 12
 
-# Analyze filter report and generate summary statistics
-uv run python scripts/analyze_quality_filter_report.py data/quality_filter/filter_report.json
+# Analyze a timestamped filter report and generate summary statistics
+uv run python scripts/analyze_quality_filter_report.py data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json
 ```
 
 ## Pipeline scripts
@@ -104,9 +109,19 @@ ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/trajectory_sample.py --b
 
 # Trajectory quality filter funnel
 ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_quality_filter.py \
-  --input data/sft_trajectories/batch_trajectories.jsonl \
-  --output-dir data/quality_filter
-uv run python scripts/analyze_quality_filter_report.py data/quality_filter/filter_report.json
+  --input-dir data/sft_trajectories \
+  --raw-glob "*_raw.json" \
+  --output-dir data/quality_filter \
+  --level2-judge-sleep-min 8 --level2-judge-sleep-max 12
+uv run python scripts/analyze_quality_filter_report.py data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json
+
+# SFT data formatting (convert raw trajectories to training-ready chat format)
+uv run python scripts/sft_formatter_full_test.py                              # Test with synthetic data
+uv run python scripts/sft_formatter_full_test.py --data-dir data/sft_trajectories --limit 50 \
+  --strategy middle --max-tokens 3277 --output-dir data/formatted_sft --export-format both
+uv run python scripts/sft_formatter_full_test.py --quality-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --output-dir data/formatted_sft --export-format both
+uv run python scripts/sft_formatter_full_test.py --format function_json       # Use JSON tool call format instead of ReAct
 ```
 
 `run_evolution.py --use-mock` is the fastest smoke test because it exercises pipeline logic without real LLM calls. Scripts in `scripts/archive/` are historical data-prep utilities rather than current entry points.
@@ -132,10 +147,10 @@ uv run python scripts/analyze_quality_filter_report.py data/quality_filter/filte
 
 - `task_generator/` defines seed/task Pydantic models, seed-pool sampling/versioning, LLM-based task generation, AST function-call parsing, and task validation.
 - `evol_instruct/` implements the multi-generation Evol-Instruct pipeline. `evolver.py` applies evolution strategies; `pipeline.py` orchestrates evolve → deduplicate → quality filter → stats.
-- `quality_filter/` contains the **trajectory quality filter funnel**: embedding-based deduplication, LLM quality discrimination (reasoning quality, tool usage, correctness), diversity metrics, and comprehensive report generation.
+- `quality_filter/` contains the **trajectory quality filter funnel**: Level 1 load/validation, Level 2 PRM-style scoring with offline Monte Carlo and optional LLM judge, Level 3 MinHash/optional embedding deduplication plus diversity metrics, Level 4 difficulty-aware sampling, AgentHER relabeling for useful failed trajectories, and comprehensive report generation.
 - `trajectory_sampler/agent_loop.py` contains the teacher-agent harness: immutable `AgentState`, termination detection, trajectory recording, ReAct/function-JSON formatting, and layered Observation→Thought→Action generation.
 - `trajectory_sampler/trajectory_sample.py` implements best-of-N concurrent sampling, trajectory ranking, failure summaries, and sandbox failure detection.
-- `dataset_builder/` is currently only a package stub.
+- `dataset_builder/` contains the SFT training data formatter with 4-role chat template support, token counting, trajectory truncation strategies, loss mask generation for scratchpad masking, and HuggingFace-compatible Parquet/JSONL export.
 
 #### Four task domains and sources
 
@@ -166,7 +181,7 @@ SeedPromptPool
   → SandboxPool / AnswerVerifier
   → TrajectoryRecorder
   → raw trajectory JSON + SFT JSON
-  → QualityFilterFunnel (deduplication → quality scoring → diversity)
+  → QualityFilterFunnel (load/validate → score → deduplicate/diversity → difficulty sampling → optional AgentHER)
   → final curated SFT dataset
 ```
 
@@ -196,16 +211,18 @@ LLM clients are duck-typed around `chat()`, `achat()`, and `achat_stream()` wher
 - `data/claude_evolved_4gen/final_evolved_v1.0_complete.json`: complete 4-generation task dataset with reference/test enrichment.
 - `data/reference_checks/`: math reference audit/fix outputs and checkpoints.
 - `data/sft_trajectories/`: raw and SFT-format trajectories, batch progress JSONL, best-of-N summaries, and benchmark reports generated by AgentLoop scripts.
+- `data/quality_filter/`: timestamped `quality_filter_report_*.json` reports and `filtered_sft_trajectories_*.json` exports from the quality filter funnel.
+- `data/formatted_sft/`: training-ready SFT data in standard chat template format (JSONL/Parquet) with loss masks. The formatter can read either raw trajectories from `--data-dir` or kept raw paths from `--quality-report`.
 
 Evolved prompt files may not have exactly the same structure as seed prompts: they can include `evolution_metadata`, omit or inherit `source`, and have `validator_code = null`.
 
 ## Testing boundaries
 
-- `tests/validation/` is offline and should be the first target for quick checks.
+- `tests/validation/` is offline and should be the first target for quick checks; sandbox-related validation tests skip when Docker is unavailable.
+- `tests/test_agent_loop.py`, `tests/test_trajectory_sample.py`, `tests/test_quality_filter.py`, and most of `tests/test_data_formatter.py` use mocks/synthetic data and do not require real API calls.
 - `tests/infra/environment/test_environment.py` and sandbox validation paths require Docker.
-- `tests/test_trajectory_sample.py` covers best-of-N sampling utilities without requiring real API calls.
-- `tests/test_vllm_client.py` requires a vLLM/Docker setup.
-- `tests/test_volcano_claude*.py` require API credentials.
+- `tests/test_vllm_client.py` mostly unit-tests client/server config, but live vLLM checks need a running endpoint.
+- `tests/test_volcano_claude*.py`, `tests/test_unified_client.py`, and trajectory-generation scripts require API credentials for live calls.
 
 ## Development notes
 
