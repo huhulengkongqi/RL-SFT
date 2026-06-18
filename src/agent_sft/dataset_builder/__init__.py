@@ -12,6 +12,7 @@ Main components:
 - SFTDataPipeline: End-to-end processing pipeline
 """
 
+from .auto_evaluator import AutoEvaluator, AutoEvaluatorConfig, EvaluationThresholds
 from .data_formatter import (
     ChatMessage,
     DataFormatter,
@@ -29,11 +30,29 @@ from .data_formatter import (
     TruncationConfig,
     TruncationStrategy,
 )
+from .dataset_builder import (
+    DatasetBuilder,
+    DatasetBuildResult,
+    DatasetManifest,
+    DatasetMixConfig,
+    DatasetSourceConfig,
+    make_default_pipeline,
+)
+from .report_generator import EvaluationReportGenerator
 
 __all__ = [
+    "AutoEvaluator",
+    "AutoEvaluatorConfig",
     "ChatMessage",
     "DataFormatter",
+    "DatasetBuilder",
+    "DatasetBuildResult",
     "DatasetExporter",
+    "DatasetManifest",
+    "DatasetMixConfig",
+    "DatasetSourceConfig",
+    "EvaluationReportGenerator",
+    "EvaluationThresholds",
     "ExportConfig",
     "FormatConfig",
     "FormattedTrajectory",
@@ -46,5 +65,6 @@ __all__ = [
     "TrajectoryTruncator",
     "TruncationConfig",
     "TruncationStrategy",
+    "make_default_pipeline",
 ]
 
