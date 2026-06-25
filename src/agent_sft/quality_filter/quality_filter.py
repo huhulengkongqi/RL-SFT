@@ -253,7 +253,7 @@ class ResultVerifier:
         domain = str(task.get("domain") or record.domain)
         test_cases = task.get("test_cases") or []
         try:
-            result = await self._verify_by_domain(domain, record.final_answer, test_cases)
+            result = await self._verify_by_domain(domain, record.final_answer, test_cases, record=record)
         except Exception as exc:
             return self._mark_failed(record, "verification_exception", str(exc))
 
@@ -269,7 +269,13 @@ class ResultVerifier:
         }
         return record
 
-    async def _verify_by_domain(self, domain: str, answer: Any, test_cases: list[dict[str, Any]]) -> VerificationResult:
+    async def _verify_by_domain(
+        self,
+        domain: str,
+        answer: Any,
+        test_cases: list[dict[str, Any]],
+        record: TrajectoryRecord | None = None,
+    ) -> VerificationResult:
         if domain in {"math", "math_reasoning", "arithmetic", "algebra"}:
             ground_truth = test_cases[0].get("expected_output", "") if test_cases else ""
             if isinstance(ground_truth, dict):
@@ -301,12 +307,81 @@ class ResultVerifier:
                     )
                     if wrapped_result.score >= result.score:
                         result = wrapped_result
+            if result.passed:
+                return result
+
+            # Report-style fallback (parity with Environment._handle_final_answer, offline):
+            # code_debug tasks whose expected_output is a debugging report cannot be
+            # validated by code execution. Fall back to format validation plus evidence
+            # of a successful exec observation recorded in the trajectory.
+            expected_output = test_cases[0].get("expected_output", {}) if test_cases else {}
+            report_fields = {"root_cause", "fixed_code", "explanation"}
+            expected_keys = set(expected_output.keys()) if isinstance(expected_output, dict) else set()
+            if expected_keys & report_fields:
+                fmt_passed, fmt_score, fmt_details = Environment._verify_code_debug_answer(answer, expected_output)
+                evidence = self._exec_evidence_from_record(record, answer, extracted_code)
+                fallback_passed = fmt_passed and evidence is not None
+                details = {
+                    "report_fallback": True,
+                    "format_checks": fmt_details,
+                    "format_score": fmt_score,
+                    "successful_exec_evidence": evidence,
+                    "code_execution": result.details,
+                }
+                return VerificationResult(
+                    mode=VerificationMode.FORMAT_VALIDATION,
+                    passed=fallback_passed,
+                    score=fmt_score if fallback_passed else min(fmt_score, 0.99),
+                    details=details,
+                    error=None if fallback_passed else "code execution failed and report fallback (format+exec evidence) did not pass",
+                )
             return result
 
         kwargs: dict[str, Any] = {}
         if test_cases and isinstance(test_cases[0].get("expected_output"), dict):
             kwargs["required_fields"] = list(test_cases[0]["expected_output"].keys())
         return await self.answer_verifier.verify(answer, mode=VerificationMode.FORMAT_VALIDATION, **kwargs)
+
+    @staticmethod
+    def _exec_evidence_from_record(
+        record: TrajectoryRecord | None, answer: Any, extracted_code: Any
+    ) -> dict[str, Any] | None:
+        """Find a recorded successful exec step that shares a function with the answer.
+
+        Offline analogue of Environment._find_successful_exec_evidence: scans the
+        recorded trajectory steps (instead of a live Environment history).
+        """
+        if record is None:
+            return None
+        answer_text = str(answer)
+        extracted_text = str(extracted_code or "")
+        steps = record.raw.get("steps") or []
+        for step in reversed(steps):
+            if not isinstance(step, dict):
+                continue
+            action = step.get("action") or {}
+            observation = step.get("observation") or {}
+            if action.get("name") != "exec" or not observation.get("success"):
+                continue
+            kwargs = action.get("kwargs") or {}
+            args = action.get("args") or []
+            executed_code = str(kwargs.get("code") or (args[0] if args else ""))
+            if not executed_code.strip():
+                continue
+            executed_functions = re.findall(r"def\s+([A-Za-z_]\w*)\s*\(", executed_code)
+            shared_function = any(
+                f"def {name}" in answer_text or f"def {name}" in extracted_text for name in executed_functions
+            )
+            substantial_overlap = (
+                len(set(executed_code.split()) & set(extracted_text.split())) >= 20 if extracted_text else False
+            )
+            if shared_function or substantial_overlap:
+                return {
+                    "matched": True,
+                    "step": step.get("step"),
+                    "executed_functions": executed_functions,
+                }
+        return None
 
     def _mark_failed(self, record: TrajectoryRecord, reason: str, error: str | None = None) -> TrajectoryRecord:
         record.quality_score = self._recorded_score(record)

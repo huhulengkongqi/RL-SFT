@@ -11,6 +11,7 @@ from typing import Any
 from agent_sft.quality_filter.metrics import DiversityMetrics
 
 from .dataset_builder import DEFAULT_DOMAIN_CATEGORY_MAP
+from .token_distribution import TokenDistributionConfig, analyze_token_distribution
 
 
 @dataclass
@@ -33,6 +34,7 @@ class AutoEvaluatorConfig:
     thresholds: EvaluationThresholds = field(default_factory=EvaluationThresholds)
     domain_category_map: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_DOMAIN_CATEGORY_MAP))
     diversity_sample_size: int = 500
+    token_distribution: TokenDistributionConfig = field(default_factory=TokenDistributionConfig)
     difficulty_buckets: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
             "easy": (0.75, 1.01),
@@ -47,24 +49,34 @@ class AutoEvaluatorConfig:
         data["difficulty_buckets"] = {key: list(value) for key, value in self.difficulty_buckets.items()}
         return data
 
-
 class AutoEvaluator:
     def __init__(self, config: AutoEvaluatorConfig | None = None, diversity_metrics: DiversityMetrics | None = None):
         self.config = config or AutoEvaluatorConfig()
         self.diversity_metrics = diversity_metrics or DiversityMetrics()
 
-    def evaluate(self, trajectories: list[dict[str, Any]], dataset_name: str | None = None) -> dict[str, Any]:
+    def evaluate(
+        self,
+        trajectories: list[dict[str, Any]],
+        dataset_name: str | None = None,
+        token_counts: list[int] | None = None,
+    ) -> dict[str, Any]:
         task_stats = self._task_pass_stats(trajectories)
         pass_at_1 = self._mean([stats["pass_at_1"] for stats in task_stats.values()])
         pass_at_8 = self._mean([stats["pass_at_8"] for stats in task_stats.values()])
         under_sampled = sum(1 for stats in task_stats.values() if stats["attempts"] < 8)
 
         diversity = self._diversity(trajectories)
-        steps = [len(record.get("steps") or []) for record in trajectories]
+        steps = [self._step_count(record) for record in trajectories]
         avg_steps = self._mean(steps)
         median_steps = statistics.median(steps) if steps else 0.0
         distributions = self._distributions(trajectories)
         observed_difficulty = self._observed_difficulty_distribution(task_stats)
+
+        token_distribution: dict[str, Any] | None = None
+        if token_counts is None:
+            token_counts = [int(t) for record in trajectories if (t := record.get("token_count"))]
+        if token_counts:
+            token_distribution = analyze_token_distribution(token_counts, self.config.token_distribution)
 
         matrix = self._metric_matrix(
             pass_at_1=pass_at_1,
@@ -74,6 +86,7 @@ class AutoEvaluator:
             difficulty_distribution=observed_difficulty["share"],
             general_share=distributions["category_share"].get("general_instruction", 0.0),
             under_sampled_tasks=under_sampled,
+            token_distribution=token_distribution,
         )
         weak_areas = [entry for entry in matrix.values() if not entry["passed"]]
 
@@ -96,10 +109,18 @@ class AutoEvaluator:
                 "min_steps": min(steps) if steps else 0,
                 "max_steps": max(steps) if steps else 0,
             },
+            "token_distribution": token_distribution,
             "distribution": distributions,
             "observed_difficulty": observed_difficulty,
             "weak_areas": weak_areas,
         }
+
+    @staticmethod
+    def _step_count(record: dict[str, Any]) -> int:
+        steps = record.get("steps")
+        if isinstance(steps, list):
+            return len(steps)
+        return int(record.get("num_steps", 0) or 0)
 
     def _task_pass_stats(self, trajectories: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -198,6 +219,7 @@ class AutoEvaluator:
         difficulty_distribution: dict[str, float],
         general_share: float,
         under_sampled_tasks: int,
+        token_distribution: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
         thresholds = self.config.thresholds
         min_difficulty = min((difficulty_distribution.get(bucket, 0.0) for bucket in self.config.difficulty_buckets), default=0.0)
@@ -234,6 +256,24 @@ class AutoEvaluator:
                 thresholds.general_share_min <= general_share <= thresholds.general_share_max,
             ),
         }
+        if token_distribution and token_distribution.get("count"):
+            tcfg = self.config.token_distribution
+            matrix["token_median_in_band"] = self._threshold_entry(
+                token_distribution["median"],
+                f"{tcfg.target_median_min:.0f} - {tcfg.target_median_max:.0f} tokens",
+                bool(token_distribution["median_in_target_band"]),
+                note=(
+                    f"median={token_distribution['median']:.0f}, "
+                    f"p50={token_distribution['percentiles']['p50']}, "
+                    f"p90={token_distribution['percentiles']['p90']}"
+                ),
+            )
+            matrix["token_lognormal"] = self._threshold_entry(
+                token_distribution["log_skewness"],
+                f"|log-skew| <= {tcfg.lognormal_skew_tolerance:.2f}",
+                bool(token_distribution["is_lognormal"]),
+                note=f"log_skewness={token_distribution['log_skewness']:.3f}",
+            )
         return matrix
 
     @staticmethod

@@ -201,18 +201,20 @@ data/sft_trajectories/realenv_<task_id>_<timestamp>_sft.json
 
 ### 6. Trajectory Quality Filter Funnel
 
-生成的轨迹经过质量过滤漏斗筛选，确保最终 SFT 数据的高质量：
+生成的轨迹经过四层质量过滤漏斗筛选，确保最终 SFT 数据的高质量：
 
 ```text
-raw trajectories
+raw trajectories (7000+)
   ↓
-embedding deduplication  (去重相似轨迹)
+Level 1 - 结果验证: AnswerVerifier / 格式校验 / LLM-Judge (通过率 ~78%)
   ↓
-LLM quality discrimination  (推理质量、工具使用、正确性评分)
+Level 2 - PRM质量评分: Monte Carlo 离线评分 + LLM Process Reward Model (通过率 ~93%)
   ↓
-diversity metrics  (多样性筛选)
+Level 3 - 去重 & 多样性: MinHash LSH + Embedding 相似度去重 (通过率 ~38%)
   ↓
-final curated SFT dataset
+Level 4 - 难度感知采样: 按 easy/medium/hard/extreme 四桶加权采样，保留难度多样性
+  ↓
+final curated SFT dataset (约 1500 条)
 ```
 
 主脚本：
@@ -220,64 +222,115 @@ final curated SFT dataset
 ```bash
 set ANTHROPIC_AUTH_TOKEN=your_api_key
 uv run python scripts/run_quality_filter.py \
-  --input data/sft_trajectories/batch_trajectories.jsonl \
+  --input-dir data/sft_trajectories \
   --output-dir data/quality_filter \
-  --sleep-min 8 \
-  --sleep-max 12
+  --level2-judge-sleep-min 8 \
+  --level2-judge-sleep-max 12
+```
 
+分析报告：
+
+```bash
 uv run python scripts/analyze_quality_filter_report.py \
-  data/quality_filter/filter_report.json
+  data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json
 ```
 
 输出：
 
 ```text
-data/quality_filter/filtered_trajectories.jsonl
-data/quality_filter/filter_report.json
-data/quality_filter/diversity_analysis.json
+data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json
+data/quality_filter/filtered_sft_trajectories_YYYYMMDD_HHMMSS.json
+```
+
+Level 4 单独重跑（无需重新跑 L1-L3）：
+
+```bash
+uv run python scripts/rerun_quality_filter_level4.py \
+  --quality-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --target-count 1500
+```
+
+难度分桶边界调整（离线重新分桶，无需重跑漏斗）：
+
+```bash
+uv run python scripts/rebucket_difficulty.py \
+  --input-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --easy-min 0.95 --medium-min 0.65 --hard-min 0.10 \
+  --level4-target-count 1593
 ```
 
 ### 7. SFT 数据格式化（训练就绪）
 
-过滤后的轨迹转换为标准 HuggingFace `trl.SFTTrainer` 兼容的 chat 格式：
+过滤后的轨迹经过质量评估和 Token 塑形，最终输出标准 HuggingFace `trl.SFTTrainer` 兼容的 chat 格式：
 
 ```text
-filtered trajectories
+quality filter report (kept list)
   ↓
-DataFormatter (ReAct / function_json 格式)
+DatasetBuilder 按 domain/category 配比采样
   ↓
-TokenCounter (chat template 精确计数)
-  ↓
-TrajectoryTruncator (middle/head/tail 截断策略)
-  ↓
-LossMaskBuilder (scratchpad 掩码、长thought屏蔽)
+SFTDataPipeline:
+  DataFormatter (ReAct / function_json 格式)
+  TokenCounter (chat template 精确计数)
+  TrajectoryTruncator (middle/head/tail 截断策略)
+  LossMaskBuilder (scratchpad 掩码、长thought屏蔽)
+  TokenShaping (长度塑形，控制中位数落在 1024-2048 区间)
   ↓
 DatasetExporter (JSONL / Parquet 导出)
+  ↓
+自动评估报告 + 加载验证
 ```
 
-主脚本：
+**一站式构建脚本（推荐）**：
+
+```bash
+# 从 quality 报告构建完整 SFT 数据集
+uv run python scripts/evaluate_sft_dataset.py \
+  --quality-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --output-dir data/formatted_sft \
+  --target-size 1500 \
+  --token-shaping \
+  --token-min 512 \
+  --token-max 3000 \
+  --validate
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--quality-report` | quality filter 输出的报告路径 |
+| `--target-size` | 最终采样条数 |
+| `--token-shaping` | 开启 token 长度塑形过滤 |
+| `--token-min / --token-max` | 塑形的 token 范围（目标中位数 1024-2048） |
+| `--validate` | 构建完成后自动验证可被 trl/verl 加载 |
+
+**独立工具脚本**：
 
 ```bash
 # 使用合成数据测试 formatter
 uv run python scripts/sft_formatter_full_test.py
 
-# 处理真实轨迹并导出
-uv run python scripts/sft_formatter_full_test.py \
-  --data-dir data/sft_trajectories --limit 50 \
-  --strategy middle --max-tokens 3277 \
-  --output-dir data/formatted_sft --export-format both
-
-# 使用 function_json 工具调用格式（而非 ReAct 文本格式）
-uv run python scripts/sft_formatter_full_test.py --format function_json
-
-# 自定义loss掩码设置（thought 超过 200 tokens 就屏蔽）
-uv run python scripts/sft_formatter_full_test.py --thought-max-tokens 200
+# 手动验证导出的数据集
+uv run python scripts/validate_sft_dataset.py \
+  data/formatted_sft/general_agent_sft_v1_YYYYMMDD_HHMMSS.parquet \
+  --max-samples 0
 ```
+
+**Token 分布塑形目标**：
+
+| 指标 | 目标 |
+|---|---|
+| Token 中位数 | 1024-2048 |
+| 对数正态分布 | `|log_skew| ≤ 0.5` |
 
 输出：
 ```text
-data/formatted_sft/formatted_sft.jsonl
-data/formatted_sft/formatted_sft.parquet
+# 训练数据集
+data/formatted_sft/general_agent_sft_v1_YYYYMMDD_HHMMSS.jsonl
+data/formatted_sft/general_agent_sft_v1_YYYYMMDD_HHMMSS.parquet
+
+# 评估报告
+data/evaluation/eval_report_YYYYMMDD_HHMMSS.md
+data/evaluation/eval_metrics_YYYYMMDD_HHMMSS.json
+data/formatted_sft/manifest_YYYYMMDD_HHMMSS.json
 ```
 
 ### 8. 当前验证策略
@@ -438,6 +491,11 @@ uv run mypy src/
 | `scripts/trajectory_sample.py` | Best-of-N 并发采样和基准测试 |
 | `scripts/run_quality_filter.py` | Trajectory 质量过滤漏斗管线 |
 | `scripts/analyze_quality_filter_report.py` | 过滤报告分析和统计摘要 |
+| `scripts/rerun_quality_filter_level4.py` | 单独重跑 Level 4 难度感知采样 |
+| `scripts/rebucket_difficulty.py` | 离线调整难度分桶边界，无需重跑 L1-L3 |
+| `scripts/merge_quality_reports.py` | 合并多份 quality 报告（如 domain 分开跑后合并） |
+| `scripts/evaluate_sft_dataset.py` | SFT 数据集构建一站式脚本：配比采样+格式化+token塑形+评估+验证 |
+| `scripts/validate_sft_dataset.py` | 独立验证脚本：检查导出的 SFT 数据集可被 trl/verl 加载 |
 | `scripts/sft_formatter_full_test.py` | SFT 数据格式化：原始轨迹转训练用chat格式、截断、loss掩码 |
 | `scripts/demo_task_generator.py` | task generation demo |
 | `scripts/demo_task_validation.py` | sandbox validation demo |
@@ -454,6 +512,7 @@ uv run mypy src/
 | `data/sft_trajectories/` | AgentLoop 生成的 raw/SFT 轨迹 |
 | `data/quality_filter/` | Trajectory 质量过滤输出和报告 |
 | `data/formatted_sft/` | 训练就绪的SFT数据（chat模板格式、JSONL/Parquet、带loss掩码） |
+| `data/evaluation/` | SFT 数据集自动评估报告和指标 |
 
 ## 许可证
 

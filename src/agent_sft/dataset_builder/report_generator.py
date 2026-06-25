@@ -64,6 +64,30 @@ class EvaluationReportGenerator:
             f"- Diversity Score (1 - Self-BLEU): {diversity.get('diversity_score', 0.0):.4f}",
         ])
 
+        token_dist = metrics.get("token_distribution")
+        if token_dist and token_dist.get("count"):
+            pct = token_dist.get("percentiles", {})
+            band = token_dist.get("target_median_range", [0, 0])
+            lines.extend([
+                "",
+                "## Token 长度分布 / Token Length Distribution",
+                "",
+                f"- Records counted: {token_dist.get('count', 0)}",
+                f"- Median: {token_dist.get('median', 0.0):.0f} "
+                f"(target {band[0]:.0f}-{band[1]:.0f}, "
+                f"{'IN BAND' if token_dist.get('median_in_target_band') else 'OUT OF BAND'})",
+                f"- Mean: {token_dist.get('mean', 0.0):.0f} | Std: {token_dist.get('std', 0.0):.0f}",
+                f"- Range: {token_dist.get('min', 0)} - {token_dist.get('max', 0)}",
+                f"- Percentiles: p10={pct.get('p10', 0)}, p25={pct.get('p25', 0)}, "
+                f"p50={pct.get('p50', 0)}, p75={pct.get('p75', 0)}, p90={pct.get('p90', 0)}, "
+                f"p95={pct.get('p95', 0)}, p99={pct.get('p99', 0)}",
+                f"- Log-normal: {'YES' if token_dist.get('is_lognormal') else 'NO'} "
+                f"(log-skewness={token_dist.get('log_skewness', 0.0):.3f}, "
+                f"log-mean={token_dist.get('log_mean', 0.0):.3f}, log-std={token_dist.get('log_std', 0.0):.3f})",
+            ])
+            if "lognormal_normaltest_p" in token_dist:
+                lines.append(f"- Log-space normaltest p-value: {token_dist['lognormal_normaltest_p']:.4f}")
+
         lines.extend(["", "## 弱项与补充建议 / Weak Areas", ""])
         weak_areas = metrics.get("weak_areas", [])
         if not weak_areas:
@@ -115,4 +139,8 @@ class EvaluationReportGenerator:
             return "建议补采低通过率任务，优先补齐 hard/extreme 难度覆盖。"
         if "fewer than 8" in note:
             return "建议对样本不足任务补齐至少 8 条独立轨迹。"
+        if "median" in note:
+            return "建议调整 token 塑形区间（--token-min/--token-max）或截断上限，使中位数落入目标带。"
+        if "log_skewness" in note:
+            return "建议通过 token 塑形过滤极端长短样本，使长度更接近对数正态分布。"
         return "建议按该指标对应数据桶追加样本后重新评估。"

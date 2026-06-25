@@ -15,12 +15,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from agent_sft.dataset_builder import (  # noqa: E402
     AutoEvaluator,
     DatasetBuilder,
+    DatasetExporter,
     DatasetMixConfig,
     DatasetSourceConfig,
     EvaluationReportGenerator,
     ExportConfig,
     SFTDataPipeline,
     SFTFormatterConfig,
+    TokenShapingConfig,
 )
 
 
@@ -39,8 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-size", type=int, default=None, help="Target mixed dataset size")
     parser.add_argument("--seed", type=int, default=0, help="Deterministic sampling seed")
     parser.add_argument("--export-format", choices=["jsonl", "parquet", "both"], default="both")
+    parser.add_argument("--token-shaping", action="store_true", help="Filter formatted records by token-length band")
+    parser.add_argument("--token-min", type=int, default=None, help="Min token_count to keep (token shaping)")
+    parser.add_argument("--token-max", type=int, default=None, help="Max token_count to keep (token shaping)")
     parser.add_argument("--evaluate-only", action="store_true", help="Evaluate inputs without formatting/exporting a dataset")
     parser.add_argument("--no-build", action="store_true", help="Alias for --evaluate-only")
+    parser.add_argument("--validate", action="store_true", help="After building, verify the export loads via chat template (trl/verl)")
     return parser.parse_args()
 
 
@@ -51,7 +57,14 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     mix_config = DatasetMixConfig(target_size=args.target_size, seed=args.seed)
-    pipeline = SFTDataPipeline(SFTFormatterConfig(export=ExportConfig(format=args.export_format)))
+    token_shaping = TokenShapingConfig(
+        enabled=args.token_shaping,
+        min_tokens=args.token_min,
+        max_tokens=args.token_max,
+    )
+    pipeline = SFTDataPipeline(
+        SFTFormatterConfig(export=ExportConfig(format=args.export_format), token_shaping=token_shaping)
+    )
     builder = DatasetBuilder(mix_config=mix_config, pipeline=pipeline)
     sources, selected_report = resolve_sources(args, builder)
 
@@ -62,19 +75,21 @@ def main() -> None:
         raw_records, source_summaries = builder.load_sources(sources)
     selected_records, selected_counts, ratio_gaps = builder.select_records(raw_records)
     evaluator = AutoEvaluator()
-    metrics = evaluator.evaluate(selected_records, dataset_name=args.dataset_name)
-    metrics["sources"] = source_summaries
-    metrics["selected_quality_report"] = str(selected_report) if selected_report else None
-    metrics["selected_counts"] = selected_counts
-    metrics["ratio_gaps"] = ratio_gaps
 
+    building = not args.evaluate_only and not args.no_build
     manifest_dict: dict[str, Any] | None = None
-    if not args.evaluate_only and not args.no_build:
-        result = builder.build(sources, output_dir=args.output_dir, dataset_name=args.dataset_name, version=version, metrics_snapshot=metrics)
+    export_paths: dict[str, str] = {}
+
+    if building:
+        result = builder.build(
+            sources, output_dir=args.output_dir, dataset_name=args.dataset_name, version=version
+        )
+        formatted_records = result.formatted_records
         manifest_dict = result.manifest.to_dict()
-        metrics["manifest_path"] = str(result.manifest_path)
-        metrics["export_paths"] = {key: str(path) for key, path in result.export_paths.items()}
+        export_paths = {key: str(path) for key, path in result.export_paths.items()}
     else:
+        # Format (with optional token shaping) to obtain token counts, without exporting.
+        formatted_records, _ = pipeline.process_batch(selected_records)
         manifest_dict = {
             "dataset_name": args.dataset_name,
             "version": version,
@@ -84,6 +99,25 @@ def main() -> None:
             "output_files": {},
         }
 
+    token_counts = [int(r["token_count"]) for r in formatted_records if r.get("token_count")]
+    metrics = evaluator.evaluate(
+        formatted_records, dataset_name=args.dataset_name, token_counts=token_counts
+    )
+    metrics["sources"] = source_summaries
+    metrics["selected_quality_report"] = str(selected_report) if selected_report else None
+    metrics["selected_counts"] = selected_counts
+    metrics["ratio_gaps"] = ratio_gaps
+    metrics["token_shaping"] = {
+        "enabled": token_shaping.enabled,
+        "min_tokens": token_shaping.min_tokens,
+        "max_tokens": token_shaping.max_tokens,
+        "selected_before_shaping": len(selected_records),
+        "records_after_shaping": len(formatted_records),
+    }
+    if building:
+        metrics["manifest_path"] = str(result.manifest_path)
+        metrics["export_paths"] = export_paths
+
     metrics_path = report_dir / f"eval_metrics_{version}.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     report = EvaluationReportGenerator().render_markdown(metrics, manifest=manifest_dict)
@@ -92,10 +126,24 @@ def main() -> None:
 
     print(f"Loaded records: {len(raw_records)}")
     print(f"Selected records: {len(selected_records)}")
+    print(f"Formatted/evaluated records: {len(formatted_records)}")
+    td = metrics.get("token_distribution") or {}
+    if td.get("count"):
+        print(
+            f"Token median: {td.get('median', 0):.0f} "
+            f"(target {td['target_median_range'][0]:.0f}-{td['target_median_range'][1]:.0f}, "
+            f"in_band={td.get('median_in_target_band')}, lognormal={td.get('is_lognormal')})"
+        )
     print(f"Metrics: {metrics_path}")
     print(f"Report: {report_path}")
-    if manifest_dict and metrics.get("manifest_path"):
+    if building and metrics.get("manifest_path"):
         print(f"Manifest: {metrics['manifest_path']}")
+
+    if args.validate and building:
+        target = export_paths.get("parquet") or export_paths.get("jsonl")
+        if target:
+            ok = DatasetExporter.validate_with_trl(target)
+            print(f"Validation (trl/verl loadable): {'PASS' if ok else 'FAIL'} -> {target}")
 
 
 def resolve_sources(args: argparse.Namespace, builder: DatasetBuilder) -> tuple[list[DatasetSourceConfig], Path | None]:

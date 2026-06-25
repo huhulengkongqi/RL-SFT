@@ -16,6 +16,25 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict, Union, cast
 logger = logging.getLogger(__name__)
 
 
+def _extract_token_ids(result: Any) -> List[int]:
+    """Normalize apply_chat_template output to a flat list of token ids.
+
+    transformers >= 5 returns a BatchEncoding/dict ({input_ids, attention_mask})
+    when tokenize=True, whereas older versions returned a plain list. Handle both,
+    and unwrap a possible batch dimension.
+    """
+    if result is None:
+        return []
+    ids: Any = result
+    if hasattr(result, "input_ids"):
+        ids = result.input_ids
+    elif isinstance(result, dict):
+        ids = result.get("input_ids", [])
+    if ids and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+    return list(ids)
+
+
 # -----------------------------------------------------------------------------
 # Type Definitions
 # -----------------------------------------------------------------------------
@@ -38,6 +57,7 @@ class FormattedTrajectory(TypedDict, total=False):
     messages: List[ChatMessage]
     token_count: int
     num_turns: int
+    num_steps: int
     success: bool
     final_score: Optional[float]
     message_loss_mask: List[Dict[str, Any]]
@@ -123,7 +143,8 @@ class TokenCounter:
                 tokenize=True,
                 add_generation_prompt=False,
             )
-            if token_ids is not None and len(token_ids) > 2:
+            token_ids = _extract_token_ids(token_ids)
+            if token_ids and len(token_ids) > 2:
                 return len(token_ids)
         except Exception as e:
             logger.debug(f"Chat template token counting failed: {e}")
@@ -167,7 +188,7 @@ class TokenCounter:
             tokenize=True,
             add_generation_prompt=False,
         )
-        return list(token_ids) if token_ids is not None else []
+        return _extract_token_ids(token_ids)
 
 
 # -----------------------------------------------------------------------------
@@ -256,6 +277,7 @@ class DataFormatter:
             "messages": messages,
             "token_count": 0,  # Populated later by TokenCounter
             "num_turns": num_turns,
+            "num_steps": len(steps),
             "success": success,
             "final_score": final_score,
         }
@@ -788,45 +810,75 @@ class DatasetExporter:
         return outputs
 
     @staticmethod
-    def validate_with_trl(dataset_path: Union[str, Path], model_name: str = "Qwen/Qwen2.5-0.5B-Instruct") -> bool:
-        """Validate that exported dataset can be loaded by trl.SFTTrainer.
+    def validate_with_trl(
+        dataset_path: Union[str, Path],
+        model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        max_samples: Optional[int] = 256,
+    ) -> bool:
+        """Validate that an exported dataset can be loaded by trl.SFTTrainer / verl.
 
-        Note: This is a lightweight validation that doesn't actually train.
+        Loads the dataset, checks the ``messages`` column and role validity, then
+        applies the model chat template to a sample of rows (this is exactly what
+        trl.SFTTrainer / verl do during tokenization). Returns True only if every
+        sampled row tokenizes without error.
 
         Args:
             dataset_path: Path to Parquet or JSONL dataset
             model_name: Model name for tokenizer
+            max_samples: Max rows to template-check (None = all rows)
 
         Returns:
             True if dataset is compatible
         """
+        valid_roles = {"system", "user", "assistant", "tool"}
         try:
             from datasets import load_dataset
             from transformers import AutoTokenizer
 
-            # Load dataset
             path_str = str(dataset_path)
             if path_str.endswith(".parquet"):
                 dataset = load_dataset("parquet", data_files=path_str, split="train")
             else:
                 dataset = load_dataset("json", data_files=path_str, split="train")
 
-            # Check for required field
             if "messages" not in dataset.column_names:
                 logger.error("Dataset missing 'messages' field")
                 return False
 
-            # Verify messages can be tokenized with chat template
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            sample = dataset[0]["messages"]
 
-            tokenizer.apply_chat_template(sample, tokenize=True)
+            total = len(dataset)
+            check_n = total if max_samples is None else min(total, max_samples)
+            failures = 0
+            for i in range(check_n):
+                messages = dataset[i]["messages"]
+                roles = {m.get("role") for m in messages}
+                bad_roles = roles - valid_roles
+                if bad_roles:
+                    logger.error(f"Row {i} has invalid roles: {bad_roles}")
+                    failures += 1
+                    continue
+                try:
+                    templated = tokenizer.apply_chat_template(messages, tokenize=True)
+                    if len(_extract_token_ids(templated)) <= 2:
+                        logger.error(f"Row {i} templated to empty token sequence")
+                        failures += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Row {i} failed chat template: {e}")
+                    failures += 1
 
-            logger.info(f"Dataset validated: {len(dataset)} records, compatible with trl.SFTTrainer")
+            if failures:
+                logger.error(f"Dataset validation failed: {failures}/{check_n} rows could not be templated")
+                return False
+
+            logger.info(
+                f"Dataset validated: {total} records ({check_n} template-checked), "
+                "compatible with trl.SFTTrainer / verl"
+            )
             return True
 
         except ImportError as e:
-            logger.warning(f"Cannot validate with trl: {e}")
+            logger.warning(f"Cannot validate: {e}")
             return False
         except Exception as e:
             logger.error(f"Dataset validation failed: {e}")
@@ -839,6 +891,20 @@ class DatasetExporter:
 
 
 @dataclass
+class TokenShapingConfig:
+    """Optional post-format filtering to shape the token-length distribution.
+
+    Drops formatted trajectories whose token_count falls outside [min_tokens,
+    max_tokens]. Useful for moving the dataset median toward the target band
+    (e.g. dropping trivially short trajectories that drag the median down).
+    """
+
+    enabled: bool = False
+    min_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+
+
+@dataclass
 class SFTFormatterConfig:
     """Full pipeline configuration."""
 
@@ -846,6 +912,7 @@ class SFTFormatterConfig:
     truncation: TruncationConfig = field(default_factory=TruncationConfig)
     loss_mask: LossMaskConfig = field(default_factory=LossMaskConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
+    token_shaping: TokenShapingConfig = field(default_factory=TokenShapingConfig)
     tokenizer_model: str = "Qwen/Qwen2.5-7B-Instruct"
 
 
@@ -903,6 +970,18 @@ class SFTDataPipeline:
             Tuple of (processed_records, export_paths)
         """
         records = [self.process_trajectory(t) for t in trajectories]
+
+        # Optional token-length shaping: drop records outside the configured band.
+        shaping = self.config.token_shaping
+        if shaping.enabled and (shaping.min_tokens is not None or shaping.max_tokens is not None):
+            lo = shaping.min_tokens if shaping.min_tokens is not None else 0
+            hi = shaping.max_tokens if shaping.max_tokens is not None else float("inf")
+            before = len(records)
+            records = [r for r in records if lo <= r["token_count"] <= hi]
+            logger.info(
+                f"Token shaping: kept {len(records)}/{before} records in band "
+                f"[{shaping.min_tokens}, {shaping.max_tokens}]"
+            )
 
         # Log stats
         token_counts = [r["token_count"] for r in records]

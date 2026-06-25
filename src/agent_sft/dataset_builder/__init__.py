@@ -26,6 +26,7 @@ from .data_formatter import (
     SFTDataPipeline,
     SFTFormatterConfig,
     TokenCounter,
+    TokenShapingConfig,
     TrajectoryTruncator,
     TruncationConfig,
     TruncationStrategy,
@@ -39,6 +40,7 @@ from .dataset_builder import (
     make_default_pipeline,
 )
 from .report_generator import EvaluationReportGenerator
+from .token_distribution import TokenDistributionConfig, analyze_token_distribution
 
 __all__ = [
     "AutoEvaluator",
@@ -62,9 +64,12 @@ __all__ = [
     "SFTDataPipeline",
     "SFTFormatterConfig",
     "TokenCounter",
+    "TokenDistributionConfig",
+    "TokenShapingConfig",
     "TrajectoryTruncator",
     "TruncationConfig",
     "TruncationStrategy",
+    "analyze_token_distribution",
     "make_default_pipeline",
 ]
 

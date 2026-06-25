@@ -188,6 +188,85 @@ async def test_result_verifier_dispatches_code_mode():
     assert fake.calls[0]["kwargs"]["function_name"] == "add"
 
 
+class FailingCodeExecVerifier:
+    """Returns a failed CODE_EXECUTION result so the report fallback path is exercised."""
+
+    async def verify(self, answer, mode, **kwargs):
+        return VerificationResult(
+            mode=mode,
+            passed=False,
+            score=0.0,
+            details={"tests_passed": 0, "tests_total": 1, "error": None},
+        )
+
+
+def _code_debug_report_raw(with_exec_evidence: bool):
+    answer = (
+        "## Root Cause\nThe bug is a missing return.\n\n"
+        "## Fixed Code\n```python\ndef merge_dicts(a, b):\n    return {**a, **b}\n```\n\n"
+        "## Explanation\nWe fix it by merging dicts."
+    )
+    steps = []
+    if with_exec_evidence:
+        steps.append({
+            "state_snapshot": {"metadata": {"task_prompt": "Fix the bug"}},
+            "action": {"action_type": "tool_call", "name": "exec",
+                       "kwargs": {"code": "def merge_dicts(a, b):\n    return {**a, **b}\nprint(merge_dicts({1:1},{2:2}))"}},
+            "observation": {"success": True, "content": "{1: 1, 2: 2}"},
+        })
+    steps.append({
+        "state_snapshot": {"metadata": {"task_prompt": "Fix the bug"}},
+        "action": {"action_type": "final_answer", "answer": answer},
+        "observation": {"success": True, "metadata": {}},
+    })
+    return {
+        "task_id": "task-cd",
+        "domain": "code_debug",
+        "difficulty": "medium",
+        "success": True,
+        "termination_reason": "success",
+        "final_score": None,
+        "steps": steps,
+    }
+
+
+@pytest.mark.asyncio
+async def test_code_debug_report_fallback_passes_with_exec_evidence():
+    verifier = ResultVerifier(answer_verifier=FailingCodeExecVerifier())
+    record = make_record(raw=_code_debug_report_raw(with_exec_evidence=True))
+    task = {
+        "id": "task-cd",
+        "domain": "code_debug",
+        "test_cases": [{"expected_output": {"root_cause": True, "fixed_code": True, "explanation": True}}],
+    }
+
+    verified = await verifier.verify_record(record, task)
+
+    level1 = verified.metadata["level1"]
+    assert level1["passed"] is True
+    assert level1["mode"] == VerificationMode.FORMAT_VALIDATION.value
+    assert level1["details"]["report_fallback"] is True
+    assert level1["details"]["successful_exec_evidence"]["matched"] is True
+
+
+@pytest.mark.asyncio
+async def test_code_debug_report_fallback_fails_without_exec_evidence():
+    verifier = ResultVerifier(answer_verifier=FailingCodeExecVerifier())
+    record = make_record(raw=_code_debug_report_raw(with_exec_evidence=False))
+    task = {
+        "id": "task-cd",
+        "domain": "code_debug",
+        "test_cases": [{"expected_output": {"root_cause": True, "fixed_code": True, "explanation": True}}],
+    }
+
+    verified = await verifier.verify_record(record, task)
+
+    level1 = verified.metadata["level1"]
+    assert level1["passed"] is False
+    assert level1["details"]["report_fallback"] is True
+    assert level1["details"]["successful_exec_evidence"] is None
+
+
 @pytest.mark.asyncio
 async def test_missing_task_fails_level1_by_default():
     verifier = ResultVerifier(answer_verifier=FakeAnswerVerifier())
