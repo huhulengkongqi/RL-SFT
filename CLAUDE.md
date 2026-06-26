@@ -41,6 +41,8 @@ uv run pytest tests/test_agent_loop.py -v                  # mocked Environment,
 uv run pytest tests/test_trajectory_sample.py -v           # best-of-N utilities, no real API required
 uv run pytest tests/test_quality_filter.py -v              # quality funnel unit coverage
 uv run pytest tests/test_data_formatter.py -v              # SFT formatter; export tests are skipped without optional deps
+uv run pytest tests/test_auto_evaluator.py -v               # SFT dataset quality auto-evaluator
+uv run pytest tests/test_token_distribution.py -v           # Token length distribution and log-normality checks
 uv run pytest tests/infra/environment/test_environment.py -v # requires Docker sandbox
 ```
 
@@ -79,6 +81,23 @@ ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_quality_filter.py \
 
 # Analyze a timestamped filter report and generate summary statistics
 uv run python scripts/analyze_quality_filter_report.py data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json
+
+# Re-run ONLY Level 4 (difficulty-aware sampling) from an existing report (no API needed)
+uv run python scripts/rerun_quality_filter_level4.py \
+  --quality-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --target-count 1500
+
+# Offline-adjust difficulty bucket boundaries without re-running L1-L3
+uv run python scripts/rebucket_difficulty.py \
+  --input-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --easy-min 0.95 --medium-min 0.65 --hard-min 0.10 \
+  --level4-target-count 1593
+
+# Merge multiple quality filter reports (e.g., when domains are processed separately)
+uv run python scripts/merge_quality_reports.py \
+  --base-report data/quality_filter/quality_filter_report_main_YYYYMMDD_HHMMSS.json \
+  --domain-report data/quality_filter/quality_filter_report_codedebug_YYYYMMDD_HHMMSS.json \
+  --domain code_debug
 ```
 
 ## Pipeline scripts
@@ -115,13 +134,24 @@ ANTHROPIC_AUTH_TOKEN=your_api_key uv run python scripts/run_quality_filter.py \
   --level2-judge-sleep-min 8 --level2-judge-sleep-max 12
 uv run python scripts/analyze_quality_filter_report.py data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json
 
-# SFT data formatting (convert raw trajectories to training-ready chat format)
+# SFT data formatting (RECOMMENDED: use evaluate_sft_dataset.py for one-stop building)
+uv run python scripts/evaluate_sft_dataset.py \
+  --quality-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
+  --output-dir data/formatted_sft \
+  --target-size 1500 \
+  --token-shaping --token-min 512 --token-max 3000 \
+  --validate
+
+# Lower-level formatter (for testing/single-format outputs)
 uv run python scripts/sft_formatter_full_test.py                              # Test with synthetic data
 uv run python scripts/sft_formatter_full_test.py --data-dir data/sft_trajectories --limit 50 \
   --strategy middle --max-tokens 3277 --output-dir data/formatted_sft --export-format both
 uv run python scripts/sft_formatter_full_test.py --quality-report data/quality_filter/quality_filter_report_YYYYMMDD_HHMMSS.json \
   --output-dir data/formatted_sft --export-format both
 uv run python scripts/sft_formatter_full_test.py --format function_json       # Use JSON tool call format instead of ReAct
+
+# Validate exported dataset is loadable by trl.SFTTrainer/verl
+uv run python scripts/validate_sft_dataset.py data/formatted_sft/general_agent_sft_v1_YYYYMMDD_HHMMSS.parquet --max-samples 0
 ```
 
 `run_evolution.py --use-mock` is the fastest smoke test because it exercises pipeline logic without real LLM calls. Scripts in `scripts/archive/` are historical data-prep utilities rather than current entry points.
@@ -140,6 +170,11 @@ uv run python scripts/sft_formatter_full_test.py --format function_json       # 
 | `trajectory_sample.py` | Best-of-N concurrent trajectory sampling |
 | `run_quality_filter.py` | Trajectory quality filter funnel pipeline |
 | `analyze_quality_filter_report.py` | Filter report analysis and summary stats |
+| `rerun_quality_filter_level4.py` | Re-run Level 4 difficulty-aware sampling only |
+| `rebucket_difficulty.py` | Offline-adjust difficulty bucket boundaries without re-running funnel |
+| `merge_quality_reports.py` | Merge multiple quality filter reports (e.g., from separate domain runs) |
+| `evaluate_sft_dataset.py` | One-stop SFT dataset building: quality filtering + token shaping + evaluation report |
+| `validate_sft_dataset.py` | Validate exported datasets are loadable by trl.SFTTrainer / verl |
 
 ## Architecture
 
@@ -150,7 +185,7 @@ uv run python scripts/sft_formatter_full_test.py --format function_json       # 
 - `quality_filter/` contains the **trajectory quality filter funnel**: Level 1 load/validation, Level 2 PRM-style scoring with offline Monte Carlo and optional LLM judge, Level 3 MinHash/optional embedding deduplication plus diversity metrics, Level 4 difficulty-aware sampling, AgentHER relabeling for useful failed trajectories, and comprehensive report generation.
 - `trajectory_sampler/agent_loop.py` contains the teacher-agent harness: immutable `AgentState`, termination detection, trajectory recording, ReAct/function-JSON formatting, and layered Observation→Thought→Action generation.
 - `trajectory_sampler/trajectory_sample.py` implements best-of-N concurrent sampling, trajectory ranking, failure summaries, and sandbox failure detection.
-- `dataset_builder/` contains the SFT training data formatter with 4-role chat template support, token counting, trajectory truncation strategies, loss mask generation for scratchpad masking, and HuggingFace-compatible Parquet/JSONL export.
+- `dataset_builder/` contains the SFT training data formatter with 4-role chat template support, token counting with chat-template-aware length calculation, trajectory truncation, loss mask generation, optional token shaping for log-normal distribution control, auto-evaluator with quality metrics, and HuggingFace-compatible Parquet/JSONL export.
 
 #### Four task domains and sources
 
