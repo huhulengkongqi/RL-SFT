@@ -1,0 +1,47 @@
+# Test Configuration - Small batch for validation
+
+pipeline:
+  name: "agent_sft_test"
+  version: "1.0.0"
+  resume: true
+  checkpoint_dir: "data/checkpoints"
+  output_dir: "data/pipeline_output"
+
+queue:
+  use_redis: false
+  redis_url: "redis://localhost:6379/0"
+  stream_max_len: 1000
+  poll_interval: 0.5
+
+flywheel:
+  enabled: false
+
+stages:
+  seed_generation:
+    enabled: true
+    workers: 1
+    seed_file: "data/final_seed_pool_181_real.json"
+
+  evolution:
+    enabled: false
+    workers: 1
+    generations: 1
+    evolutions_per_seed: 1
+    min_sleep: 2.0
+    max_sleep: 3.0
+
+  trajectory_generation:
+    enabled: false
+    workers: 1
+    max_steps: 10
+    sleep_min: 2.0
+    sleep_max: 3.0
+    sandbox_pool_size: 2
+
+  quality_filter:
+    enabled: false
+    workers: 1
+
+  dataset_build:
+    enabled: false
+    workers: 1

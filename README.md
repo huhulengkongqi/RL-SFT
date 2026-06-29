@@ -333,7 +333,81 @@ data/evaluation/eval_metrics_YYYYMMDD_HHMMSS.json
 data/formatted_sft/manifest_YYYYMMDD_HHMMSS.json
 ```
 
-### 8. 当前验证策略
+### 8. 🚀 一站式 DAG 流水线（新增 ✨）
+
+不想逐个脚本跑？直接跑一条命令从 Seed 到 SFT 数据集：
+
+```powershell
+# Windows PowerShell
+uv run python scripts/run_orchestrator.py --config config/pipeline_default.yaml --limit 50
+```
+
+```bash
+# Linux / Mac / Git Bash / WSL
+./scripts/run_pipeline.sh --limit 50
+```
+
+**流水线架构：**
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      Pipeline Orchestrator                        │
+│              YAML 配置驱动 | DAG 调度 | Checkpoint 断点续跑        │
+└────────┬───────────────────────┬─────────────────────┬───────────┘
+         ↓                       ↓                     ↓
+┌─────────────────┐    ┌────────────────────┐   ┌──────────────────┐
+│ Seed Worker ×2 │    │ Trajectory Worker ×4│   │ Quality Worker ×4│
+└────────┬────────┘    └─────────┬──────────┘   └────────┬─────────┘
+         ↓                       ↓                     ↓
+┌──────────────────────────────────────────────────────────────────┐
+│                    InMemory Queue / Redis Stream                  │
+│    tasks:new → tasks:seeded → tasks:evolved → trajectories:new →  │
+│                  trajectories:filtered → dataset                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**核心特性：**
+| 特性 | 说明 |
+|------|------|
+| ✅ 断点续跑 | 每个任务状态持久化到 JSONL，Ctrl+C 后重新跑自动跳过已完成的任务 |
+| ✅ 自动重试 | 失败任务自动重试最多 3 次 |
+| ✅ 阶段隔离 | 每个阶段独立统计 completed / failed，单阶段失败不影响其他阶段 |
+| ✅ 实时监控 | 每个阶段完成后输出 completed / failed 统计 |
+| ✅ 可横向扩展 | 每个阶段可配置独立 Worker 数量（evolution 和 trajectory 阶段可多配） |
+| ✅ 数据隔离 | 每次运行生成唯一 `run_id`，输出目录完全隔离，永不覆盖 |
+
+**Pipeline 执行摘要示例：**
+```text
+Stage Status:
+  seed_generation           completed  completed=50 failed=0
+  evolution                 completed  completed=50 failed=1
+  trajectory_generation     completed  completed=49 failed=0
+  quality_filter            completed  completed=49 failed=0
+  dataset_build             completed  completed=49 failed=0
+```
+
+**配置文件位置：** `config/pipeline_default.yaml`
+
+```yaml
+stages:
+  seed_generation:
+    enabled: true
+    workers: 2
+  evolution:
+    enabled: true
+    workers: 4
+    generations: 1
+  trajectory_generation:
+    enabled: true
+    workers: 4
+  quality_filter:
+    enabled: true
+    workers: 4
+  dataset_build:
+    enabled: true
+    workers: 1
+```
+
+### 9. 当前验证策略
 
 真实环境入口：
 

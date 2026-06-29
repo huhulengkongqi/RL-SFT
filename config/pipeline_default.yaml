@@ -1,0 +1,65 @@
+# Pipeline Orchestrator Configuration
+
+pipeline:
+  name: "agent_sft_pipeline"
+  version: "1.0.0"
+  resume: true
+  checkpoint_dir: "data/checkpoints"
+  output_dir: "data/pipeline_output"
+
+queue:
+  use_redis: false
+  redis_url: "redis://localhost:6379/0"
+  stream_max_len: 10000
+  poll_interval: 0.5
+
+flywheel:
+  enabled: false
+  max_iterations: 3
+  teacher_model_version: "v1"
+  min_improvement: 0.05
+
+stages:
+  seed_generation:
+    enabled: true
+    workers: 2
+    seed_file: "data/final_seed_pool_181_real.json"
+
+  evolution:
+    enabled: true
+    workers: 2
+    generations: 1
+    evolutions_per_seed: 1
+    use_claude: true
+    claude_model: "ark-code-latest"
+    min_sleep: 5.0
+    max_sleep: 10.0
+
+  trajectory_generation:
+    enabled: true
+    workers: 2
+    max_steps: 20
+    sleep_min: 5.0
+    sleep_max: 10.0
+    model: "ark-code-latest"
+    sandbox_pool_size: 4
+
+  quality_filter:
+    enabled: true
+    workers: 4
+    level2_prm: true
+    level2_judge: false
+    level3_dedup: true
+    level4_sampling: true
+    her_relabeling: true
+    target_count: 1500
+
+  dataset_build:
+    enabled: true
+    workers: 1
+    target_size: 1500
+    token_shaping: true
+    token_min: 512
+    token_max: 3000
+    export_format: "both"
+    validate: true
